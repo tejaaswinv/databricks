@@ -8,12 +8,12 @@ RUN curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_
  && chmod 755 /app/duckdb
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libstdc++6 libjemalloc2 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libstdc++6 && rm -rf /var/lib/apt/lists/*
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=builder /app/engine /app/engine
 COPY --from=builder /app/duckdb /app/duckdb
 COPY run.sh /app/run.sh
 RUN chmod 755 /app/engine /app/duckdb /app/run.sh
-ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 MALLOC_CONF=narenas:8,background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1
+ENV OMP_PROC_BIND=true OMP_PLACES=cores
 WORKDIR /app
 CMD ["/app/run.sh"]
