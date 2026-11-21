@@ -249,41 +249,30 @@ struct FlatNumPeople{
  }
 };
 struct FlatEventIndex {
- vector<uint32_t> buckets;
- size_t used = 0;
- vector<Cand>& rows;
- explicit FlatEventIndex(vector<Cand>& v,size_t expected):rows(v) {
-   size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
-   buckets.assign(cap,0);
+ vector<uint64_t> keys;vector<uint32_t> vals;
+ size_t used=0;vector<Cand>& rows;
+ explicit FlatEventIndex(vector<Cand>& v,size_t expected):rows(v){
+  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
+  keys.resize(cap);vals.resize(cap);
  }
- uint32_t get_or_create(const Cand& c) {
-   if(used*10>=buckets.size()*7)grow();
-   size_t mask=buckets.size()-1;
-   uint64_t ckey=c.idtag&~NONCOMPACT_PAYLOAD;
-   size_t p=(size_t)ckey&mask;
-   for(;;) {
-     uint32_t v=buckets[p];
-     if(!v) {
-       uint32_t id=(uint32_t)rows.size();
-       buckets[p]=id+1;used++;
-       return UINT32_MAX;
-     }
-     const Cand& old=rows[v-1];uint64_t okey=old.idtag&~NONCOMPACT_PAYLOAD;
-     if(ckey==okey){
-      if((ckey&NONCANON_ID)==0 || cand_eventid(c)==cand_eventid(old))return v-1;
-     }
-     p=(p+1)&mask;
+ uint32_t get_or_create(const Cand& c){
+  if(used*10>=vals.size()*7)grow();
+  size_t mask=vals.size()-1;uint64_t ckey=c.idtag&~NONCOMPACT_PAYLOAD;size_t p=(size_t)ckey&mask;
+  for(;;){
+   uint32_t v=vals[p];
+   if(!v){uint32_t id=(uint32_t)rows.size();keys[p]=ckey;vals[p]=id+1;used++;return UINT32_MAX;}
+   if(keys[p]==ckey){
+    if((ckey&NONCANON_ID)==0 || cand_eventid(c)==cand_eventid(rows[v-1]))return v-1;
    }
+   p=(p+1)&mask;
+  }
  }
- void grow() {
-   vector<uint32_t> nb(buckets.size()*2,0);
-   size_t mask=nb.size()-1;
-   for(uint32_t v:buckets) if(v) {
-     size_t p=(size_t)(rows[v-1].idtag&~NONCOMPACT_PAYLOAD)&mask;
-     while(nb[p])p=(p+1)&mask;
-     nb[p]=v;
-   }
-   buckets.swap(nb);
+ void grow(){
+  vector<uint64_t> nk(keys.size()*2);vector<uint32_t> nv(vals.size()*2);size_t mask=nv.size()-1;
+  for(size_t i=0;i<vals.size();i++)if(vals[i]){
+   size_t p=(size_t)keys[i]&mask;while(nv[p])p=(p+1)&mask;nk[p]=keys[i];nv[p]=vals[i];
+  }
+  keys.swap(nk);vals.swap(nv);
  }
 };
 struct FlatClickSet {
@@ -301,22 +290,20 @@ struct FlatClickSet {
  }
 };
 struct FlatClickCandIndex {
- vector<uint32_t> buckets;
- vector<ClickCand>& rows;
+ vector<uint64_t> keys;vector<uint32_t> vals;vector<ClickCand>& rows;
  explicit FlatClickCandIndex(vector<ClickCand>& r,size_t expected):rows(r){
-  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);
+  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;keys.resize(cap);vals.resize(cap);
  }
  bool insert(const ClickCand& c){
-  size_t p=(size_t)c.idtag&(buckets.size()-1);
-  while(buckets[p]){
-   const ClickCand& old=rows[buckets[p]-1];
-   if(c.idtag==old.idtag){
+  size_t p=(size_t)c.idtag&(vals.size()-1);
+  while(vals[p]){
+   if(keys[p]==c.idtag){
+    const ClickCand& old=rows[vals[p]-1];
     if((c.idtag>>63)==0 || c.clickid==old.clickid)return false;
    }
-   p=(p+1)&(buckets.size()-1);
+   p=(p+1)&(vals.size()-1);
   }
-  buckets[p]=(uint32_t)rows.size()+1;
-  return true;
+  keys[p]=c.idtag;vals[p]=(uint32_t)rows.size()+1;return true;
  }
 };
 static int64_t parse_ingest(SV s){
