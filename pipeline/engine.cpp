@@ -284,6 +284,8 @@ int main(){
  omp_set_num_threads(max(1,ncpu));
 #endif
  auto t0=chrono::steady_clock::now();
+ auto mark=t0;
+ auto lap=[&](const char* name){auto now=chrono::steady_clock::now();cerr<<"phase "<<name<<"="<<chrono::duration<double>(now-mark).count()<<"s\n";mark=now;};
  // Manifest: strict ISO timestamps at start and end. No JSON dependency.
  ifstream manifest(data+"/manifest.json"); string json((istreambuf_iterator<char>(manifest)),{});
  auto field=[&](const string&key){auto p=json.find('"'+key+'"');if(p==string::npos)fail("manifest missing "+key);p=json.find(':',p);p=json.find('"',p);auto q=json.find('"',p+1);return json.substr(p+1,q-p-1);};
@@ -317,7 +319,7 @@ int main(){
  for(size_t i=0;i<dsu.nodes.size();++i)person_map.add_link(dsu.nodes[i].value,link_person[i]);
  dsu.index.clear();dsu.index.rehash(0);
  auto person_for=[&](SV name)->uint32_t{return person_map.get(name);};
- cerr<<"links nodes="<<dsu.nodes.size()<<"\n";
+ cerr<<"links nodes="<<dsu.nodes.size()<<"\n";lap("links_dims");
  // Event dedup happens before *all* event validation.
  // Batch parse in parallel, then independently deduplicate by exact event ID.
  auto event_paths=input_files(data+"/events");
@@ -375,6 +377,7 @@ int main(){
    p=(q==end)?end:q+1;
   }
  }
+ lap("event_parse");
  vector<vector<Cand>> unique(PARTS);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
@@ -394,7 +397,7 @@ int main(){
   }
   unique[part]=move(cands);
  }
- vector<vector<Cand>>().swap(raw);
+ vector<vector<Cand>>().swap(raw);lap("event_dedup");
  vector<Evt> events;events.reserve(event_capacity);
  for(auto& rows:unique){
   for(const Cand& c:rows){
@@ -410,7 +413,7 @@ int main(){
   vector<Cand>().swap(rows);
  }
  vector<vector<Cand>>().swap(unique);
- cerr<<"valid events="<<events.size()<<" people="<<people.size()<<"\n";
+ cerr<<"valid events="<<events.size()<<" people="<<people.size()<<"\n";lap("event_validate");
  // Clicks: identical duplicates can safely be deduped after validation.
  vector<Click> clicks;clicks.reserve(max<size_t>(1000,events.size()/4));
  FlatClickSet click_seen(clicks,max<size_t>(1000,events.size()/4));
@@ -425,9 +428,9 @@ int main(){
   });
  }
  click_seen.buckets.clear();click_seen.buckets.shrink_to_fit();
- cerr<<"valid clicks="<<clicks.size()<<"\n";
+ cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
  // Sessions from globally sorted valid events, across every linked ID.
- order_events(events);
+ order_events(events);lap("event_sort");
  vector<UserDay> ud;ud.reserve(people.size()*2);
  vector<Session> sessions;sessions.reserve(events.size()/4+1);
  vector<Buy> buys;buys.reserve(events.size()/32+1);
@@ -445,7 +448,7 @@ int main(){
   if(e.is_purchase){s.purchased=1;s.revenue+=e.price;u.revenue+=e.price;buys.push_back({s.userday,e.category,e.price});}
  }
  vector<Evt>().swap(events);
- cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";
+ cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
  // Purchase category totals are per person-day, NOT per session, with byte-order ties.
  sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
  uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
@@ -455,10 +458,10 @@ int main(){
   if(amt>bestamt||(amt==bestamt && (bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){bestamt=amt;bestcat=cat;ud[curr].top_category=cat;}
   i=j;
  }
- vector<Buy>().swap(buys);
+ vector<Buy>().swap(buys);lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
  auto campref=[&](uint16_t id,int32_t day)->CampDay&{return camp[(size_t)id*nday+day-day_base];};
- order_clicks(clicks);
+ order_clicks(clicks);lap("click_sort");
  // A single latest click cursor gives correct inclusive, 7-day, byte-wise tie attribution.
  size_t c=0;uint32_t prev_person=UINT32_MAX;
  int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
@@ -480,11 +483,12 @@ int main(){
   s.credited=credited;
   auto &a=campref(credited,epoch_day(s.start));a.sessions++;a.revenue+=s.revenue;a.purchasing+=s.purchased;
  }
+ lap("attribution");
  // Assist counting uses merged intervals for each (person,campaign); no giant range join.
  // This handles all clicks on a shared device and arbitrarily long ID chains.
  vector<Assist> aids;aids.reserve(clicks.size());for(const Click&x:clicks)aids.push_back({x.person,x.t,x.campaign,0});
  vector<Click>().swap(clicks);
- order_assists(aids);
+ order_assists(aids);lap("assist_sort");
  // Build offset index: person -> [first,last) in the session array.
  vector<pair<size_t,size_t>> spans(people.size(),{0,0});
  for(size_t i=0;i<sessions.size();){size_t j=i+1;while(j<sessions.size()&&sessions[j].person==sessions[i].person)j++;spans[sessions[i].person]={i,j};i=j;}
@@ -507,6 +511,7 @@ int main(){
   }
   count_assists(p,campaign,from,to);i=j;
  }
+ lap("assist_count");
  fs::create_directories(out);
  // Write unquoted TSV-style output with no field containing tabs/newlines per the input dialect.
  // Input values cannot contain commas, so a strict CSV output is sufficient.
@@ -522,6 +527,7 @@ int main(){
    write_field(f,campaigns[id]);f<<',';write_field(f,channels[id]);f<<','<<date_string(d+day_base)<<','<<v.sessions<<','<<v.purchasing<<','<<v.revenue<<','<<v.assists<<'\n';
   }
  }
+ lap("csv_output");
  cerr<<"engine time="<<chrono::duration<double>(chrono::steady_clock::now()-t0).count()<<"s\n";
  return 0;
 }
