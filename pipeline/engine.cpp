@@ -137,7 +137,7 @@ struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
-struct PendingEvt{SV user;uint32_t t;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused=0;};
+struct PendingEvt{SV user;uint32_t t;int32_t price;uint32_t user_hash;uint16_t category;uint8_t is_purchase;uint8_t unused=0;};
 struct CampDay{int64_t sessions=0,purchasing=0,revenue=0,assists=0;};
 // Open-addressing dedup index: cache-friendly, compact, collision-safe.
 // An entry stores the 1-based index into Cand; full keys are compared on match.
@@ -166,14 +166,15 @@ struct FastPeople {
   while(!buckets[p].key.empty())p=(p+1)&(buckets.size()-1);
   buckets[p]={key,person};used++;
  }
- uint32_t find_only(SV key) const {
-  size_t p=Hash{}(key)&(buckets.size()-1);
+ uint32_t find_hashed(SV key,size_t h) const {
+  size_t p=h&(buckets.size()-1);
   while(!buckets[p].key.empty()) {
     if(buckets[p].key==key)return buckets[p].person;
     p=(p+1)&(buckets.size()-1);
   }
   return UINT32_MAX;
  }
+ uint32_t find_only(SV key) const {return find_hashed(key,Hash{}(key));}
  uint32_t get(SV key) {
   if(used*10>=buckets.size()*7)grow();
   size_t p=Hash{}(key)&(buckets.size()-1);
@@ -185,6 +186,25 @@ struct FastPeople {
   people.push_back(key);
   buckets[p]={key,id}; used++;
   return id;
+ }
+};
+struct FlatStandalone {
+ struct Slot{SV key;uint32_t person=0;};
+ vector<Slot> buckets;size_t used=0;
+ explicit FlatStandalone(size_t expected=16){size_t cap=16;while(cap<expected*2)cap<<=1;buckets.resize(cap);}
+ void grow(){
+  vector<Slot> nb(buckets.size()*2);size_t mask=nb.size()-1;
+  for(const auto&e:buckets)if(!e.key.empty()){size_t p=Hash{}(e.key)&mask;while(!nb[p].key.empty())p=(p+1)&mask;nb[p]=e;}
+  buckets.swap(nb);
+ }
+ uint32_t get_or_add(SV key,size_t h,atomic<uint32_t>& next,vector<SV>& people){
+  if(used*10>=buckets.size()*7)grow();
+  size_t p=h&(buckets.size()-1);
+  while(!buckets[p].key.empty()){
+   if(buckets[p].key==key)return buckets[p].person;
+   p=(p+1)&(buckets.size()-1);
+  }
+  uint32_t id=next.fetch_add(1,memory_order_relaxed);buckets[p]={key,id};used++;people[id]=key;return id;
  }
 };
 struct FlatEventIndex {
@@ -460,7 +480,7 @@ int main(){
       if(tp==2){int32_t pv=parse_price(f[6]);if(pv>0)price_code=(uint32_t)pv;}
       uint16_t user_code=span_code(line,f[1]),prod_code=span_code(line,f[5]);
       aux1=(uint64_t)user_code|((uint64_t)prod_code<<16)|((uint64_t)toff<<32);
-      aux2=(uint64_t)price_code|((uint64_t)tp<<24);
+      aux2=(uint64_t)price_code|((uint64_t)tp<<24)|((uint64_t)(uint32_t)Hash{}(f[1])<<32);
      }else{
       tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
       aux1=(uint64_t)(uintptr_t)f[0].data();aux2=f[0].size();
@@ -507,16 +527,16 @@ int main(){
   pending.reserve(rows.size()/3+16);
   SV f[7];
   for(const Cand& c:rows){
-   SV user,prod;uint8_t tp;uint32_t t;int32_t price=0;
+   SV user,prod;uint8_t tp;uint32_t t,user_hash;int32_t price=0;
    if((c.idtag>>63)==0){
     user=cand_span16(c,0);prod=cand_span16(c,1);
-    t=(uint32_t)(c.aux1>>32);tp=(uint8_t)((c.aux2>>24)&3);
+    t=(uint32_t)(c.aux1>>32);tp=(uint8_t)((c.aux2>>24)&3);user_hash=(uint32_t)(c.aux2>>32);
     if(user.empty()||prod.empty()||tp==3||t==UINT32_MAX)continue;
     if(c.ingest-(ws+(int64_t)t)>DAY)continue;
     if(tp==2){price=(int32_t)(c.aux2&0xffffffu);if(price<=0)continue;}
    }else{
     if(!split_csv(c.line,7,f))continue;
-    user=f[1];prod=f[5];
+    user=f[1];prod=f[5];user_hash=(uint32_t)Hash{}(user);
     tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
     if(user.empty()||prod.empty()||tp==3)continue;
     int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
@@ -525,9 +545,9 @@ int main(){
    }
    uint16_t cat=unknown;
    if(tp==2){auto it=products.find(prod);if(it!=products.end())cat=it->second;}
-   uint32_t p=person_map.find_only(user);
+   uint32_t p=person_map.find_hashed(user,user_hash);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
-   else pending.push_back({user,t,price,cat,(uint8_t)(tp==2),0});
+   else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
  }
@@ -541,10 +561,10 @@ int main(){
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
  // so assignment order is irrelevant; every equal byte string still gets exactly one person.
  constexpr size_t ID_SHARDS=256;
- array<unordered_map<SV,uint32_t,Hash,Eq>,ID_SHARDS> standalone;
+ size_t per_shard=max<size_t>(16,pending_n/20/ID_SHARDS+8);
+ vector<FlatStandalone> standalone;standalone.reserve(ID_SHARDS);
+ for(size_t i=0;i<ID_SHARDS;i++)standalone.emplace_back(per_shard);
  array<mutex,ID_SHARDS> standalone_mu;
- size_t per_shard=max<size_t>(16,pending_n/24/ID_SHARDS+8);
- for(auto& m:standalone)m.reserve(per_shard);
  uint32_t people_base=(uint32_t)people.size();
  people.resize((size_t)people_base+pending_n);
  atomic<uint32_t> next_person(people_base);
@@ -557,17 +577,10 @@ int main(){
   auto& dst=resolved_pending[part];
   dst.reserve(src.size());
   for(const PendingEvt& e:src){
-   size_t h=Hash{}(e.user), sh=h&(ID_SHARDS-1);
-   uint32_t p;
+   size_t h=e.user_hash,sh=h&(ID_SHARDS-1);uint32_t p;
    {
     lock_guard<mutex> lock(standalone_mu[sh]);
-    auto& m=standalone[sh];
-    auto it=m.find(e.user);
-    if(it==m.end()){
-     p=next_person.fetch_add(1,memory_order_relaxed);
-     m.emplace(e.user,p);
-     people[p]=e.user;
-    }else p=it->second;
+    p=standalone[sh].get_or_add(e.user,h,next_person,people);
    }
    dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
   }
