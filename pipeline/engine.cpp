@@ -123,7 +123,8 @@ struct UnionFind{
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
-struct Cand{SV line;uint64_t aux1,aux2;int64_t ingest;uint64_t idtag;}; // canonical: packed field spans; fallback: event-id ptr/len
+static constexpr uint64_t NONCOMPACT_PAYLOAD=1ULL<<62, NONCANON_ID=1ULL<<63;
+struct Cand{SV line;uint64_t aux1,aux2;int64_t ingest;uint64_t idtag;};
 static inline SV cand_eventid(const Cand& c){return SV((const char*)(uintptr_t)c.aux1,(size_t)c.aux2);}
 static inline uint16_t span12(SV line,SV f){return (uint16_t)((f.data()-line.data())|((uint16_t)f.size()<<8));}
 static inline SV cand_span12(const Cand& c,int slot){
@@ -224,7 +225,8 @@ struct FlatEventIndex {
  uint32_t get_or_create(const Cand& c) {
    if(used*10>=buckets.size()*7)grow();
    size_t mask=buckets.size()-1;
-   size_t p=(size_t)c.idtag&mask;
+   uint64_t ckey=c.idtag&~NONCOMPACT_PAYLOAD;
+   size_t p=(size_t)ckey&mask;
    for(;;) {
      uint32_t v=buckets[p];
      if(!v) {
@@ -232,9 +234,9 @@ struct FlatEventIndex {
        buckets[p]=id+1;used++;
        return UINT32_MAX;
      }
-     const Cand& old=rows[v-1];
-     if(c.idtag==old.idtag){
-      if((c.idtag>>63)==0 || cand_eventid(c)==cand_eventid(old))return v-1;
+     const Cand& old=rows[v-1];uint64_t okey=old.idtag&~NONCOMPACT_PAYLOAD;
+     if(ckey==okey){
+      if((ckey&NONCANON_ID)==0 || cand_eventid(c)==cand_eventid(old))return v-1;
      }
      p=(p+1)&mask;
    }
@@ -243,7 +245,7 @@ struct FlatEventIndex {
    vector<uint32_t> nb(buckets.size()*2,0);
    size_t mask=nb.size()-1;
    for(uint32_t v:buckets) if(v) {
-     size_t p=(size_t)rows[v-1].idtag&mask;
+     size_t p=(size_t)(rows[v-1].idtag&~NONCOMPACT_PAYLOAD)&mask;
      while(nb[p])p=(p+1)&mask;
      nb[p]=v;
    }
@@ -487,9 +489,9 @@ int main(){
    const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
    SV line(p,q-p);
    if(split_csv(line,7,f)&&!f[0].empty()){
-     uint64_t n,tag,aux1,aux2;
-     uint64_t uk=0;
-     bool compact=canonical_base36_id(f[0],'e',n) && canonical_base36_id(f[1],'u',uk) && line.size()<256
+     uint64_t n=0,tag,aux1,aux2,uk=0;
+     bool event_canon=canonical_base36_id(f[0],'e',n);
+     bool compact=event_canon && canonical_base36_id(f[1],'u',uk) && line.size()<256
        && f[1].size()<=15 && f[5].size()<=15
        && f[1].data()-line.data()<=255 && f[5].data()-line.data()<=255;
      if(compact){
@@ -503,7 +505,7 @@ int main(){
       aux1=(uint64_t)user_code|((uint64_t)prod_code<<12)|((uint64_t)toff<<24)|(((uk>>38)&3ULL)<<55);
       aux2=(uint64_t)price_code|((uint64_t)tp<<24)|((uk&((1ULL<<38)-1))<<26);
      }else{
-      tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
+      tag=event_canon?(n|NONCOMPACT_PAYLOAD):(NONCANON_ID|(uint64_t(Hash{}(f[0]))&0x3fffffffffffffffULL));
       aux1=(uint64_t)(uintptr_t)f[0].data();aux2=f[0].size();
      }
      raw[tid*PARTS+((size_t)tag%PARTS)].push_back({line,aux1,aux2,parse_ingest(f[3]),tag});
@@ -549,7 +551,7 @@ int main(){
   SV f[7];
   for(const Cand& c:rows){
    SV user,prod;uint8_t tp;uint32_t t,user_hash=0;uint64_t uk=UINT64_MAX;int32_t price=0;
-   if((c.idtag>>63)==0){
+   if((c.idtag&(NONCANON_ID|NONCOMPACT_PAYLOAD))==0){
     user=cand_span12(c,0);prod=cand_span12(c,1);uk=cand_user_key(c);
     t=(uint32_t)((c.aux1>>24)&0x7fffffffU);tp=(uint8_t)((c.aux2>>24)&3);
     if(user.empty()||prod.empty()||tp==3||t==0x7fffffffU)continue;
