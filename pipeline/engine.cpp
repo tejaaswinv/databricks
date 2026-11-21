@@ -156,15 +156,23 @@ struct UnionFind{
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
 static constexpr uint64_t NONCOMPACT_PAYLOAD=1ULL<<62, NONCANON_ID=1ULL<<63, MASK40=(1ULL<<40)-1;
-struct Cand{uint64_t x0,x1;int64_t ingest;uint64_t idtag;}; // 32 bytes: packed winner data or raw line ptr/len
-static inline SV cand_line(const Cand& c){return SV((const char*)(uintptr_t)c.x0,(size_t)c.x1);}
+struct Cand{uint64_t x0,x1,idtag;}; // 24 bytes: compact generated payload or exact wide fallback
+static inline SV cand_line(const Cand& c){return SV((const char*)(uintptr_t)c.x0,(size_t)(c.x1&0xffffffULL));}
 static inline SV cand_eventid(const Cand& c){SV f[7];return split_csv(cand_line(c),7,f)?f[0]:SV{};}
 static inline uint64_t cand_user_key(const Cand& c){return c.x0&MASK40;}
 static inline uint32_t cand_time(const Cand& c){return (uint32_t)((c.x0>>40)|((c.x1&0x7fULL)<<24));}
 static inline int32_t cand_price(const Cand& c){return (int32_t)((c.x1>>7)&0xffffffULL);}
-static inline uint16_t cand_category(const Cand& c){return (uint16_t)((c.x1>>31)&0xffffULL);}
-static inline uint8_t cand_type(const Cand& c){return (uint8_t)((c.x1>>47)&3ULL);}
-static inline bool cand_product_empty(const Cand& c){return ((c.x1>>49)&1ULL)!=0;}
+static inline uint16_t cand_category(const Cand& c){return (uint16_t)((c.x1>>31)&0xffULL);}
+static inline uint8_t cand_type(const Cand& c){return (uint8_t)((c.x1>>39)&3ULL);}
+static inline bool cand_product_empty(const Cand& c){return ((c.x1>>41)&1ULL)!=0;}
+static inline int64_t sign40(uint64_t x){return (int64_t)(x<<24)>>24;}
+static inline int64_t cand_ingest_ms(const Cand& c,int64_t ws){
+ if((c.idtag&(NONCANON_ID|NONCOMPACT_PAYLOAD))==0){
+  uint64_t sec=(c.x1>>42)&0x3fffffULL;
+  return ws-WEEK+(int64_t)sec*1000;
+ }
+ return sign40(c.x1>>24)*1000;
+}
 static string canonical_user_name(uint64_t v){
  char b[16];int at=15;b[at--]=0;static constexpr char d[]="0123456789abcdefghijklmnopqrstuvwxyz";
  do{b[at--]=d[v%36];v/=36;}while(v);b[at]='u';return string(b+at);
@@ -540,28 +548,34 @@ int main(){
    const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
    SV line(p,q-p);
    if(split_csv(line,7,f)&&!f[0].empty()){
-     uint64_t n=0,tag,uk=0,x0,x1;
+     uint64_t n=0,tag,uk=0,x0,x1;int64_t ingest=parse_ingest(f[3]);
      bool event_canon=canonical_base36_id(f[0],'e',n);
      bool compact=event_canon && canonical_base36_id(f[1],'u',uk);
+     uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
+     int64_t ts;uint32_t toff=0x7fffffffU;
+     if(parse_time(f[2],ts)&&ts>=ws&&ts<we)toff=(uint32_t)(ts-ws);
+     uint32_t price_code=0;if(tp==2){int32_t pv=parse_price(f[6]);if(pv>0)price_code=(uint32_t)pv;}
+     bool prod_empty=f[5].empty();uint16_t cat=unknown;
+     if(tp==2&&!prod_empty&&price_code){
+      uint32_t pn;
+      if(product_number(f[5],pn)&&pn<product_fast.size())cat=product_fast[pn]==UINT16_MAX?unknown:product_fast[pn];
+      else {auto it=products.find(f[5]);if(it!=products.end())cat=it->second;}
+     }
+     int64_t ingest_sec=ingest/1000;
+     int64_t ingest_code=ingest_sec-(ws-WEEK)/1000;
+     compact=compact && cat<=255 && ingest_code>=0 && ingest_code<(1LL<<22);
      if(compact){
       tag=n;
-      uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-      int64_t ts;uint32_t toff=0x7fffffffU;
-      if(parse_time(f[2],ts)&&ts>=ws&&ts<we)toff=(uint32_t)(ts-ws);
-      uint32_t price_code=0;if(tp==2){int32_t pv=parse_price(f[6]);if(pv>0)price_code=(uint32_t)pv;}
-      bool prod_empty=f[5].empty();uint16_t cat=unknown;
-      if(tp==2&&!prod_empty&&price_code){
-       uint32_t pn;
-       if(product_number(f[5],pn)&&pn<product_fast.size())cat=product_fast[pn]==UINT16_MAX?unknown:product_fast[pn];
-       else {auto it=products.find(f[5]);if(it!=products.end())cat=it->second;}
-      }
       x0=(uk&MASK40)|((uint64_t)(toff&0xffffffU)<<40);
-      x1=((uint64_t)(toff>>24)&0x7fULL)|((uint64_t)price_code<<7)|((uint64_t)cat<<31)|((uint64_t)tp<<47)|((uint64_t)prod_empty<<49);
+      x1=((uint64_t)(toff>>24)&0x7fULL)|((uint64_t)price_code<<7)|((uint64_t)cat<<31)|((uint64_t)tp<<39)|((uint64_t)prod_empty<<41)|((uint64_t)ingest_code<<42);
      }else{
       tag=event_canon?(n|NONCOMPACT_PAYLOAD):(NONCANON_ID|(uint64_t(Hash{}(f[0]))&0x3fffffffffffffffULL));
-      x0=(uint64_t)(uintptr_t)line.data();x1=line.size();
+      if(line.size()>0xffffffULL)continue;
+      x0=(uint64_t)(uintptr_t)line.data();
+      uint64_t sec40=(uint64_t)ingest_sec&0xffffffffffULL;
+      x1=(uint64_t)line.size()|(sec40<<24);
      }
-     raw[tid*PARTS+((size_t)(tag&~NONCOMPACT_PAYLOAD)%PARTS)].push_back({x0,x1,parse_ingest(f[3]),tag});
+     raw[tid*PARTS+((size_t)(tag&~NONCOMPACT_PAYLOAD)%PARTS)].push_back({x0,x1,tag});
    }
    p=(q==end)?end:q+1;
   }
@@ -580,7 +594,7 @@ int main(){
    for(const Cand& c:rows){
       uint32_t ix=idx.get_or_create(c);
       if(ix==UINT32_MAX)cands.push_back(c);
-      else if(c.ingest<cands[ix].ingest)cands[ix]=c;
+      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
    }
    vector<Cand>().swap(rows);
   }
@@ -607,7 +621,7 @@ int main(){
    if((c.idtag&(NONCANON_ID|NONCOMPACT_PAYLOAD))==0){
     uk=cand_user_key(c);t=cand_time(c);tp=cand_type(c);price=cand_price(c);cat=cand_category(c);
     if(cand_product_empty(c)||tp==3||t==0x7fffffffU)continue;
-    if(c.ingest-(ws+(int64_t)t)>DAY)continue;
+    if(cand_ingest_ms(c,ws)-(ws+(int64_t)t)>DAY)continue;
     if(tp==2&&price<=0)continue;
    }else{
     SV fline=cand_line(c);if(!split_csv(fline,7,f))continue;
@@ -615,7 +629,7 @@ int main(){
     if(!canonical_base36_id(user,'u',uk))user_hash=(uint32_t)Hash{}(user);
     tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
     if(user.empty()||prod.empty()||tp==3)continue;
-    int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
+    int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||cand_ingest_ms(c,ws)-ts>DAY)continue;
     t=(uint32_t)(ts-ws);
     if(tp==2){
      price=parse_price(f[6]);if(price<=0)continue;uint32_t pn;
