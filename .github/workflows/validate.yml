@@ -22,8 +22,14 @@ jobs:
           unzip -q /tmp/answer.zip
       - name: Inspect generator ID encoding
         run: |
-          echo '=== generator ID-related source ==='
-          grep -RInE 'event_id|click_id|base36|scram|encode|fn .*id|to_radix|radix' generator/src generator/*.rs 2>/dev/null | head -n 220 || true
+          echo '=== text.rs base36/scramble ==='
+          sed -n '185,235p' generator/src/text.rs
+          echo '=== user.rs event ids ==='
+          sed -n '295,330p' generator/src/user.rs
+          echo '=== user.rs click ids ==='
+          sed -n '445,475p' generator/src/user.rs
+          echo '=== dataset keys ==='
+          grep -RInE 'event_key|click_key|user_key|struct Dataset' generator/src | head -n 100
       - name: Build official generator
         run: |
           cargo --version
