@@ -244,7 +244,7 @@ inline void write_users(const fs::path& path,size_t first,size_t last,UGet uid,D
   c.push_back(w.write_i64_col(first,last,events));
   c.push_back(w.write_i64_col(first,last,revenue));
   c.push_back(w.write_string_col(first,last,true,has_top,top));
-  w.add_group(std::move(c),last-first);w.finish();
+  if(last>first)w.add_group(std::move(c),last-first);w.finish();
 }
 
 template<class IGet,class CGet,class DGet,class SGet,class PGet,class RGet,class AGet>
@@ -260,6 +260,6 @@ inline void write_campaigns(const fs::path& path,size_t rows,IGet id,CGet channe
   c.push_back(w.write_i64_col(0,rows,purchasing));
   c.push_back(w.write_i64_col(0,rows,revenue));
   c.push_back(w.write_i64_col(0,rows,assists));
-  w.add_group(std::move(c),rows);w.finish();
+  if(rows)w.add_group(std::move(c),rows);w.finish();
 }
 } // namespace nativepq
