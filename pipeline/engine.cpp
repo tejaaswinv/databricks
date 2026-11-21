@@ -135,7 +135,7 @@ struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t un
 struct ClickCand{SV clickid,user;uint64_t idtag;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
-struct Session{int64_t start;uint32_t person;uint32_t unused=0;};
+struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
 struct PendingEvt{SV user;uint32_t t;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused=0;};
 struct CampDay{int64_t sessions=0,purchasing=0,revenue=0,assists=0;};
@@ -656,57 +656,26 @@ int main(){
  }
  vector<vector<ClickCand>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
- // Fused state machine: sort events/clicks once, then create sessions and assign
- // last-click attribution in the same pass over sorted events.
- order_clicks(clicks);lap("click_sort");
+ // Sessions from globally sorted valid events, across every linked ID.
  order_events(events);lap("event_sort");
- vector<CampDay> camp((size_t)campaigns.size()*nday);
- auto campref=[&](uint16_t id,int32_t day)->CampDay&{return camp[(size_t)id*nday+day-day_base];};
  vector<UserDay> ud;ud.reserve(people.size()*2);
  vector<Session> sessions;sessions.reserve(events.size()/4+1);
  vector<Buy> buys;buys.reserve(events.size()/32+1);
- const int64_t click_base=ws-WEEK;
- size_t c=0;uint32_t click_person=UINT32_MAX;int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
- uint32_t lastperson=UINT32_MAX,lastt=0,current_userday=UINT32_MAX;
- int64_t current_start=0,current_revenue=0;uint16_t current_credit=organic;uint8_t current_purchased=0;
- auto close_session=[&](){
-  if(current_userday==UINT32_MAX)return;
-  auto&a=campref(current_credit,epoch_day(current_start));
-  a.sessions++;a.revenue+=current_revenue;a.purchasing+=current_purchased;
- };
- auto credit_for=[&](uint32_t person,int64_t start)->uint16_t{
-  if(person!=click_person){
-   click_person=person;lastclicktime=INT64_MIN;lastcampaign=organic;
-   while(c<clicks.size()&&clicks[c].person<person)c++;
-  }
-  uint32_t session_ct=(uint32_t)(start-click_base);
-  while(c<clicks.size()&&clicks[c].person==person&&clicks[c].t<=session_ct){
-   uint32_t t=clicks[c].t;size_t j=c+1,best=c;
-   while(j<clicks.size()&&clicks[j].person==person&&clicks[j].t==t){
-    if(byte_less(clicks[j].clickid,clicks[best].clickid))best=j;
-    j++;
-   }
-   lastclicktime=click_base+(int64_t)t;lastcampaign=clicks[best].campaign;c=j;
-  }
-  return (lastclicktime!=INT64_MIN&&start-lastclicktime<=WEEK)?lastcampaign:organic;
- };
+ uint32_t lastperson=UINT32_MAX,lastt=0;
  for(const Evt&e:events){
   if(e.person!=lastperson||uint64_t(e.t)-lastt>(uint64_t)GAP){
-   close_session();
-   current_start=ws+(int64_t)e.t;current_revenue=0;current_purchased=0;
-   int32_t d=epoch_day(current_start);
+   int64_t start=ws+(int64_t)e.t;
+   int32_t d=epoch_day(start);
    if(ud.empty()||ud.back().person!=e.person||ud.back().day!=d)ud.push_back({e.person,d});
-   current_userday=(uint32_t)(ud.size()-1);ud.back().sessions++;
-   current_credit=credit_for(e.person,current_start);
-   sessions.push_back({current_start,e.person,0});
+   ud.back().sessions++;
+   sessions.push_back({start,0,e.person,(uint32_t)(ud.size()-1),organic,0,0});
   }
   lastperson=e.person;lastt=e.t;
-  UserDay&u=ud[current_userday];u.events++;
-  if(e.is_purchase){current_purchased=1;current_revenue+=e.price;u.revenue+=e.price;buys.push_back({current_userday,e.category,e.price});}
+  Session& s=sessions.back();UserDay&u=ud[s.userday];u.events++;
+  if(e.is_purchase){s.purchased=1;s.revenue+=e.price;u.revenue+=e.price;buys.push_back({s.userday,e.category,e.price});}
  }
- close_session();
  vector<Evt>().swap(events);
- cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("fused_sessions_attribution");
+ cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
  // Purchase category totals are per person-day, NOT per session, with byte-order ties.
  sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
  uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
@@ -717,6 +686,31 @@ int main(){
   i=j;
  }
  vector<Buy>().swap(buys);lap("top_category");
+ vector<CampDay> camp((size_t)campaigns.size()*nday);
+ auto campref=[&](uint16_t id,int32_t day)->CampDay&{return camp[(size_t)id*nday+day-day_base];};
+ order_clicks(clicks);lap("click_sort");
+ // A single latest click cursor gives correct inclusive, 7-day, byte-wise tie attribution.
+ size_t c=0;uint32_t prev_person=UINT32_MAX;
+ int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
+ const int64_t click_base=ws-WEEK;
+ for(Session& s:sessions){
+  if(s.person!=prev_person){prev_person=s.person;lastclicktime=INT64_MIN;lastcampaign=organic;
+   while(c<clicks.size()&&clicks[c].person<s.person)c++;
+  }
+  uint32_t session_ct=(uint32_t)(s.start-click_base);
+  while(c<clicks.size()&&clicks[c].person==s.person&&clicks[c].t<=session_ct){
+   uint32_t t=clicks[c].t;size_t j=c+1;size_t best=c;
+   while(j<clicks.size()&&clicks[j].person==s.person&&clicks[j].t==t){
+    if(byte_less(clicks[j].clickid,clicks[best].clickid))best=j;
+    j++;
+   }
+   lastclicktime=click_base+(int64_t)t;lastcampaign=clicks[best].campaign;c=j;
+  }
+  uint16_t credited=(lastclicktime!=INT64_MIN && s.start-lastclicktime<=WEEK)?lastcampaign:organic;
+  s.credited=credited;
+  auto &a=campref(credited,epoch_day(s.start));a.sessions++;a.revenue+=s.revenue;a.purchasing+=s.purchased;
+ }
+ lap("attribution");
  // Assist counting uses merged intervals for each (person,campaign); no giant range join.
  // This handles all clicks on a shared device and arbitrarily long ID chains.
  vector<Assist> aids;aids.reserve(clicks.size());for(const Click&x:clicks)aids.push_back({x.person,x.t,x.campaign,0});
