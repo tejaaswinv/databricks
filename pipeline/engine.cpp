@@ -31,7 +31,19 @@ using namespace std;
 namespace fs = std::filesystem;
 using SV = string_view;
 static constexpr int64_t DAY=86400000LL, WEEK=7*DAY, HOUR=3600000LL, GAP=1800000LL;
-struct Hash { using is_transparent=void; size_t operator()(SV s) const { return hash<SV>{}(s); } };
+static inline uint64_t hash_mix(uint64_t x){
+ x^=x>>30;x*=0xbf58476d1ce4e5b9ULL;x^=x>>27;x*=0x94d049bb133111ebULL;x^=x>>31;return x;
+}
+struct Hash {
+ using is_transparent=void;
+ size_t operator()(SV s) const noexcept {
+  const char* p=s.data();size_t n=s.size();uint64_t a=0,b=0;
+  if(n<=8){if(n)memcpy(&a,p,n);return (size_t)hash_mix(a^(uint64_t(n)*0x9e3779b97f4a7c15ULL));}
+  memcpy(&a,p,8);memcpy(&b,p+n-8,8);
+  b=(b<<27)|(b>>(64-27));
+  return (size_t)hash_mix(a^b^(uint64_t(n)*0x9e3779b97f4a7c15ULL));
+ }
+};
 struct Eq {using is_transparent=void; bool operator()(SV a,SV b) const {return a==b;} };
 static bool byte_less(SV a,SV b) {return lexicographical_compare(a.begin(),a.end(),b.begin(),b.end(),[](char x,char y){return (unsigned char)x<(unsigned char)y;});}
 static bool digits(SV v) {if(v.empty())return false; for(unsigned char ch:v)if(ch<'0'||ch>'9')return false;return true;}
@@ -135,7 +147,7 @@ struct FastPeople {
   vector<Slot> bigger(buckets.size()*2);
   size_t mask=bigger.size()-1;
   for(const auto& e:buckets)if(!e.key.empty()){
-    size_t i=hash<SV>{}(e.key)&mask;
+    size_t i=Hash{}(e.key)&mask;
     while(!bigger[i].key.empty())i=(i+1)&mask;
     bigger[i]=e;
   }
@@ -143,12 +155,12 @@ struct FastPeople {
  }
  void add_link(SV key,uint32_t person) {
   if(used*10>=buckets.size()*7)grow();
-  size_t p=hash<SV>{}(key)&(buckets.size()-1);
+  size_t p=Hash{}(key)&(buckets.size()-1);
   while(!buckets[p].key.empty())p=(p+1)&(buckets.size()-1);
   buckets[p]={key,person};used++;
  }
  uint32_t find_only(SV key) const {
-  size_t p=hash<SV>{}(key)&(buckets.size()-1);
+  size_t p=Hash{}(key)&(buckets.size()-1);
   while(!buckets[p].key.empty()) {
     if(buckets[p].key==key)return buckets[p].person;
     p=(p+1)&(buckets.size()-1);
@@ -157,7 +169,7 @@ struct FastPeople {
  }
  uint32_t get(SV key) {
   if(used*10>=buckets.size()*7)grow();
-  size_t p=hash<SV>{}(key)&(buckets.size()-1);
+  size_t p=Hash{}(key)&(buckets.size()-1);
   while(!buckets[p].key.empty()) {
     if(buckets[p].key==key)return buckets[p].person;
     p=(p+1)&(buckets.size()-1);
@@ -208,10 +220,10 @@ struct FlatClickSet {
  size_t used=0;
  explicit FlatClickSet(vector<Click>& r,size_t expected):rows(r){size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);}
  void grow(){vector<uint32_t> nb(buckets.size()*2);size_t mask=nb.size()-1;
-  for(uint32_t v:buckets)if(v){size_t p=hash<SV>{}(rows[v-1].clickid)&mask;while(nb[p])p=(p+1)&mask;nb[p]=v;}
+  for(uint32_t v:buckets)if(v){size_t p=Hash{}(rows[v-1].clickid)&mask;while(nb[p])p=(p+1)&mask;nb[p]=v;}
   buckets.swap(nb);
  }
- bool insert(SV k){if(used*10>=buckets.size()*7)grow();size_t p=hash<SV>{}(k)&(buckets.size()-1);
+ bool insert(SV k){if(used*10>=buckets.size()*7)grow();size_t p=Hash{}(k)&(buckets.size()-1);
   while(buckets[p]){if(rows[buckets[p]-1].clickid==k)return false;p=(p+1)&(buckets.size()-1);}
   buckets[p]=(uint32_t)rows.size()+1;used++;return true;
  }
@@ -407,7 +419,7 @@ int main(){
    const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
    SV line(p,q-p);
    if(split_csv(line,7,f)&&!f[0].empty()){
-     size_t h=hash<SV>{}(f[0]);
+     size_t h=Hash{}(f[0]);
      raw[tid*PARTS+(h%PARTS)].push_back({line,f[0],parse_ingest(f[3]),(uint32_t)h&0x00ffffffu,0});
    }
    p=(q==end)?end:q+1;
@@ -550,7 +562,7 @@ int main(){
     if(ci!=campaign_ids.end()){
      int64_t ts;
      if(parse_time(f[3],ts)&&ts>=ws-WEEK&&ts<we){
-      size_t h=hash<SV>{}(f[0]);uint32_t hp=(uint32_t)h&0x00ffffffu;
+      size_t h=Hash{}(f[0]);uint32_t hp=(uint32_t)h&0x00ffffffu;
       uint32_t person=person_map.find_only(f[1]);
       click_raw[tid*CPARTS+(h%CPARTS)].push_back({f[0],f[1],(uint32_t)(ts-(ws-WEEK)),person,hp,ci->second,0});
      }
