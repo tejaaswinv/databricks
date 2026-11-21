@@ -7,7 +7,7 @@ export TMPDIR="$SCRATCH_DIR" HOME="$SCRATCH_DIR"
 /app/engine
 
 mkdir -p "$OUTPUT_DIR/user_daily" "$OUTPUT_DIR/campaign_daily"
-threads="${NCPU:-8}"
+threads="1"
 mem="${MEM_GB:-24}"
 /app/duckdb -batch -c "
 SET threads = $threads;
