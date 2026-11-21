@@ -101,9 +101,9 @@ struct UnionFind{
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
 struct Cand{SV eventid, user, ts, prod; int64_t ingest; int32_t price; uint8_t type;};
-struct Evt{int64_t ts;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
-struct Click{int64_t ts;uint32_t person;uint16_t campaign;SV clickid;};
-struct Assist{uint32_t person;uint16_t campaign;int64_t ts;};
+struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
+struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
+struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
@@ -210,29 +210,64 @@ static void write_field(ostream&os,SV s){
  if(s.find('\r')==SV::npos){os.write(s.data(),s.size());return;}
  os.put('"');os.write(s.data(),s.size());os.put('"');
 }
-static void order_events(vector<Evt> &es){
- auto less=[](const Evt&a,const Evt&b){return a.person<b.person || (a.person==b.person && a.ts<b.ts);};
+template<class T,class Key>
+static void radix64(vector<T>& a, Key key, int passes=4){
+ if(a.size()<2)return;
+ constexpr size_t R=1u<<16, MASK=R-1;
+ int nt=1;
 #ifdef _OPENMP
- __gnu_parallel::sort(es.begin(),es.end(),less);
-#else
- sort(es.begin(),es.end(),less);
+ nt=max(1,omp_get_max_threads());
 #endif
+ vector<T> tmp(a.size());
+ vector<size_t> hist((size_t)nt*R), pos((size_t)nt*R);
+ for(int pass=0;pass<passes;pass++){
+  fill(hist.begin(),hist.end(),0);
+  unsigned shift=pass*16;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+   int tid=0;
+#ifdef _OPENMP
+   tid=omp_get_thread_num();
+#endif
+   size_t lo=a.size()*(size_t)tid/nt, hi=a.size()*(size_t)(tid+1)/nt;
+   size_t* h=hist.data()+(size_t)tid*R;
+   for(size_t i=lo;i<hi;i++)h[(key(a[i])>>shift)&MASK]++;
+  }
+  size_t base=0;
+  for(size_t b=0;b<R;b++){
+   size_t total=0;
+   for(int t=0;t<nt;t++)total+=hist[(size_t)t*R+b];
+   size_t p=base;
+   for(int t=0;t<nt;t++){pos[(size_t)t*R+b]=p;p+=hist[(size_t)t*R+b];}
+   base+=total;
+  }
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+   int tid=0;
+#ifdef _OPENMP
+   tid=omp_get_thread_num();
+#endif
+   size_t lo=a.size()*(size_t)tid/nt, hi=a.size()*(size_t)(tid+1)/nt;
+   size_t* p=pos.data()+(size_t)tid*R;
+   for(size_t i=lo;i<hi;i++){size_t b=(key(a[i])>>shift)&MASK;tmp[p[b]++]=a[i];}
+  }
+  a.swap(tmp);
+ }
+}
+static void order_events(vector<Evt>& es){
+ radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
 static void order_clicks(vector<Click>& cs){
- auto less=[](const Click&a,const Click&b){if(a.person!=b.person)return a.person<b.person;if(a.ts!=b.ts)return a.ts<b.ts;return byte_less(b.clickid,a.clickid);};
-#ifdef _OPENMP
- __gnu_parallel::sort(cs.begin(),cs.end(),less);
-#else
- sort(cs.begin(),cs.end(),less);
-#endif
+ radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
 }
 static void order_assists(vector<Assist>& as){
- auto less=[](const Assist&a,const Assist&b){if(a.person!=b.person)return a.person<b.person;if(a.campaign!=b.campaign)return a.campaign<b.campaign;return a.ts<b.ts;};
-#ifdef _OPENMP
- __gnu_parallel::sort(as.begin(),as.end(),less);
-#else
- sort(as.begin(),as.end(),less);
-#endif
+ // Stable LSD: first (campaign,time), then person.
+ radix64(as,[](const Assist&a){return (uint64_t(a.campaign)<<32)|a.t;},3);
+ radix64(as,[](const Assist&a){return uint64_t(a.person);},2);
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
@@ -363,7 +398,7 @@ int main(){
     if(c.price<=0)continue;
     price=c.price;auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
    }
-   events.push_back({ts,person_for(c.user),price,cat,(uint8_t)(c.type==2),0});
+   events.push_back({(uint32_t)(ts-ws),person_for(c.user),price,cat,(uint8_t)(c.type==2),0});
   }
   vector<Cand>().swap(rows);
  }
@@ -379,7 +414,7 @@ int main(){
    auto it=campaign_ids.find(f[2]);if(it==campaign_ids.end())return;
    int64_t ts;if(!parse_time(f[3],ts)||ts<ws-WEEK||ts>=we)return;
    if(!click_seen.insert(f[0]))return;
-   clicks.push_back({ts,person_for(f[1]),it->second,f[0]});
+   clicks.push_back({f[0],(uint32_t)(ts-(ws-WEEK)),person_for(f[1]),it->second,0});
   });
  }
  click_seen.buckets.clear();click_seen.buckets.shrink_to_fit();
@@ -389,15 +424,16 @@ int main(){
  vector<UserDay> ud;ud.reserve(people.size()*2);
  vector<Session> sessions;sessions.reserve(events.size()/4+1);
  vector<Buy> buys;buys.reserve(events.size()/32+1);
- uint32_t lastperson=UINT32_MAX;int64_t lastts=INT64_MIN;
+ uint32_t lastperson=UINT32_MAX,lastt=0;
  for(const Evt&e:events){
-  if(e.person!=lastperson||e.ts-lastts>GAP){
-   int32_t d=epoch_day(e.ts);
+  if(e.person!=lastperson||uint64_t(e.t)-lastt>(uint64_t)GAP){
+   int64_t start=ws+(int64_t)e.t;
+   int32_t d=epoch_day(start);
    if(ud.empty()||ud.back().person!=e.person||ud.back().day!=d)ud.push_back({e.person,d});
    ud.back().sessions++;
-   sessions.push_back({e.ts,0,e.person,(uint32_t)(ud.size()-1),organic,0,0});
+   sessions.push_back({start,0,e.person,(uint32_t)(ud.size()-1),organic,0,0});
   }
-  lastperson=e.person;lastts=e.ts;
+  lastperson=e.person;lastt=e.t;
   Session& s=sessions.back();UserDay&u=ud[s.userday];u.events++;
   if(e.is_purchase){s.purchased=1;s.revenue+=e.price;u.revenue+=e.price;buys.push_back({s.userday,e.category,e.price});}
  }
@@ -419,12 +455,19 @@ int main(){
  // A single latest click cursor gives correct inclusive, 7-day, byte-wise tie attribution.
  size_t c=0;uint32_t prev_person=UINT32_MAX;
  int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
+ const int64_t click_base=ws-WEEK;
  for(Session& s:sessions){
   if(s.person!=prev_person){prev_person=s.person;lastclicktime=INT64_MIN;lastcampaign=organic;
    while(c<clicks.size()&&clicks[c].person<s.person)c++;
   }
-  while(c<clicks.size()&&clicks[c].person==s.person&&clicks[c].ts<=s.start){
-   lastclicktime=clicks[c].ts;lastcampaign=clicks[c].campaign;c++;
+  uint32_t session_ct=(uint32_t)(s.start-click_base);
+  while(c<clicks.size()&&clicks[c].person==s.person&&clicks[c].t<=session_ct){
+   uint32_t t=clicks[c].t;size_t j=c+1;size_t best=c;
+   while(j<clicks.size()&&clicks[j].person==s.person&&clicks[j].t==t){
+    if(byte_less(clicks[j].clickid,clicks[best].clickid))best=j;
+    j++;
+   }
+   lastclicktime=click_base+(int64_t)t;lastcampaign=clicks[best].campaign;c=j;
   }
   uint16_t credited=(lastclicktime!=INT64_MIN && s.start-lastclicktime<=WEEK)?lastcampaign:organic;
   s.credited=credited;
@@ -432,7 +475,7 @@ int main(){
  }
  // Assist counting uses merged intervals for each (person,campaign); no giant range join.
  // This handles all clicks on a shared device and arbitrarily long ID chains.
- vector<Assist> aids;aids.reserve(clicks.size());for(const Click&x:clicks)aids.push_back({x.person,x.campaign,x.ts});
+ vector<Assist> aids;aids.reserve(clicks.size());for(const Click&x:clicks)aids.push_back({x.person,x.t,x.campaign,0});
  vector<Click>().swap(clicks);
  order_assists(aids);
  // Build offset index: person -> [first,last) in the session array.
@@ -449,9 +492,9 @@ int main(){
   }
  };
  for(size_t i=0;i<aids.size();){uint32_t p=aids[i].person;uint16_t campaign=aids[i].campaign;
-  int64_t from=aids[i].ts,to=aids[i].ts+WEEK;size_t j=i+1;
+  int64_t from=click_base+(int64_t)aids[i].t,to=from+WEEK;size_t j=i+1;
   while(j<aids.size()&&aids[j].person==p&&aids[j].campaign==campaign){
-    int64_t a=aids[j].ts,b=a+WEEK;
+    int64_t a=click_base+(int64_t)aids[j].t,b=a+WEEK;
     if(a<=to){to=max(to,b);}else{count_assists(p,campaign,from,to);from=a;to=b;}
     j++;
   }
