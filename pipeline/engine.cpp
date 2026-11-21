@@ -106,15 +106,23 @@ struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
 static vector<fs::path> input_files(const string& dir){vector<fs::path> files; if(!fs::exists(dir))return files;for(auto&e:fs::directory_iterator(dir))if(e.is_regular_file()&&e.path().extension()==".csv")files.push_back(e.path());sort(files.begin(),files.end());return files;}
 static bool split_csv(SV s,int n,SV *out){
  if(s.empty())return false;
- if(memchr(s.data(),'"',s.size())==nullptr){
-  size_t from=0;
-  for(int k=0;k<n;k++){
-   size_t pos=s.find(',',from);
-   if(k==n-1){if(pos!=SV::npos)return false;pos=s.size();}
-   else if(pos==SV::npos)return false;
-   out[k]=s.substr(from,pos-from);from=pos+1;
+ // Common generator path: unquoted CSV with a fixed field count.
+ // Scan once, recording commas while simultaneously detecting quotes.
+ {
+  const char* b=s.data();const char* e=b+s.size();const char* start=b;int k=0;bool quoted=false;
+  for(const char* p=b;p<e;p++){
+   unsigned char c=(unsigned char)*p;
+   if(c=='"'){quoted=true;break;}
+   if(c==','){
+    if(k>=n-1)return false;
+    out[k++]=SV(start,(size_t)(p-start));start=p+1;
+   }
   }
-  return true;
+  if(!quoted){
+   if(k!=n-1)return false;
+   out[k]=SV(start,(size_t)(e-start));
+   return true;
+  }
  }
  size_t from=0;for(int k=0;k<n;k++){
   size_t pos=s.find(',',from);
