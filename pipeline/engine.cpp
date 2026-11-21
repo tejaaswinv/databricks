@@ -539,49 +539,29 @@ int main(){
  vector<Evt> events;events.reserve(good_n+pending_n);
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
- // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
- // so assignment order is irrelevant; every equal byte string still gets exactly one person.
- constexpr size_t ID_SHARDS=256;
- array<unordered_map<SV,uint32_t,Hash,Eq>,ID_SHARDS> standalone;
- array<mutex,ID_SHARDS> standalone_mu;
- size_t per_shard=max<size_t>(16,pending_n/24/ID_SHARDS+8);
- for(auto& m:standalone)m.reserve(per_shard);
- uint32_t people_base=(uint32_t)people.size();
- people.resize((size_t)people_base+pending_n);
- atomic<uint32_t> next_person(people_base);
- vector<vector<Evt>> resolved_pending(PARTS);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  auto& src=pending_by_part[part];
-  auto& dst=resolved_pending[part];
-  dst.reserve(src.size());
-  for(const PendingEvt& e:src){
-   size_t h=e.user_hash, sh=h&(ID_SHARDS-1);
-   uint32_t p;
-   {
-    lock_guard<mutex> lock(standalone_mu[sh]);
-    auto& m=standalone[sh];
-    auto it=m.find(e.user);
-    if(it==m.end()){
-     p=next_person.fetch_add(1,memory_order_relaxed);
-     m.emplace(e.user,p);
-     people[p]=e.user;
-    }else p=it->second;
-   }
-   dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
-  }
-  vector<PendingEvt>().swap(src);
- }
- uint32_t final_people=next_person.load(memory_order_relaxed);
- people.resize(final_people);
- // Make the newly assigned IDs available to click processing. This is once per unique
- // ID rather than once per event.
- for(uint32_t p=people_base;p<final_people;p++)person_map.add_link(people[p],p);
- for(auto& v:resolved_pending){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
- vector<vector<Evt>>().swap(resolved_pending);
+ // Resolve standalone IDs with a radix grouping on the cached 32-bit hash.
+ // Equal hashes are still compared byte-for-byte, so collisions never merge identities.
+ vector<PendingEvt> pending_all;pending_all.reserve(pending_n);
+ for(auto&src:pending_by_part){pending_all.insert(pending_all.end(),src.begin(),src.end());vector<PendingEvt>().swap(src);}
  vector<vector<PendingEvt>>().swap(pending_by_part);
+ radix64(pending_all,[](const PendingEvt&e){return (uint64_t)e.user_hash;},2);
+ for(size_t i=0;i<pending_all.size();){
+  size_t j=i+1;while(j<pending_all.size()&&pending_all[j].user_hash==pending_all[i].user_hash)j++;
+  SV first_name=pending_all[i].user;
+  uint32_t first_person=(uint32_t)people.size();people.push_back(first_name);person_map.add_link(first_name,first_person);
+  vector<pair<SV,uint32_t>> collisions;
+  for(size_t z=i;z<j;z++){
+   const auto&e=pending_all[z];uint32_t p=first_person;
+   if(e.user!=first_name){
+    p=UINT32_MAX;
+    for(const auto&x:collisions)if(x.first==e.user){p=x.second;break;}
+    if(p==UINT32_MAX){p=(uint32_t)people.size();people.push_back(e.user);person_map.add_link(e.user,p);collisions.push_back({e.user,p});}
+   }
+   events.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
+  }
+  i=j;
+ }
+ vector<PendingEvt>().swap(pending_all);
  auto validate_t2=chrono::steady_clock::now();
  cerr<<"subphase winner_validate="<<chrono::duration<double>(validate_t1-validate_t0).count()<<"s standalone_resolve="<<chrono::duration<double>(validate_t2-validate_t1).count()<<"s\n";
  cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<pending_n<<"\n";lap("event_validate");
