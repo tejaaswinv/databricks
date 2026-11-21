@@ -86,7 +86,7 @@ static string date_string(int32_t z) {
  char buf[20];snprintf(buf,sizeof(buf),"%04d-%02u-%02u",y,m,d);return string(buf);
 }
 struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
- Mapping(const fs::path& path){int fd=open(path.c_str(),O_RDONLY);if(fd<0){perror("open");exit(2);}struct stat st{};if(fstat(fd,&st)){perror("stat");exit(2);}n=st.st_size;if(n){posix_fadvise(fd,0,0,POSIX_FADV_SEQUENTIAL);void* m=mmap(nullptr,n,PROT_READ,MAP_PRIVATE,fd,0);if(m==MAP_FAILED){perror("mmap");exit(2);}p=(char*)m;madvise((void*)p,n,MADV_SEQUENTIAL);}close(fd);}
+ Mapping(const fs::path& path){int fd=open(path.c_str(),O_RDONLY);if(fd<0){perror("open");exit(2);}struct stat st{};if(fstat(fd,&st)){perror("stat");exit(2);}n=st.st_size;if(n){void* m=mmap(nullptr,n,PROT_READ,MAP_PRIVATE,fd,0);if(m==MAP_FAILED){perror("mmap");exit(2);}p=(char*)m;}close(fd);}
  Mapping(const Mapping&)=delete;Mapping& operator=(const Mapping&)=delete;
  Mapping(Mapping&&o)noexcept:p(o.p),n(o.n){o.p=nullptr;o.n=0;}
  Mapping&operator=(Mapping&&o)noexcept{if(p)munmap((void*)p,n);p=o.p;n=o.n;o.p=nullptr;o.n=0;return *this;}
@@ -126,8 +126,8 @@ struct UnionFind{
 struct Cand{SV line;uint64_t aux1,aux2;int64_t ingest;uint64_t idtag;}; // canonical: packed field spans; fallback: event-id ptr/len
 static inline SV cand_eventid(const Cand& c){return SV((const char*)(uintptr_t)c.aux1,(size_t)c.aux2);}
 static inline uint16_t span_code(SV line,SV f){return (uint16_t)((f.data()-line.data())|((uint16_t)f.size()<<8));}
-static inline SV cand_span(const Cand& c,int slot){
- uint16_t code=slot<4?(uint16_t)(c.aux1>>(slot*16)):(uint16_t)c.aux2;
+static inline SV cand_span16(const Cand& c,int slot){
+ uint16_t code=(uint16_t)(c.aux1>>(slot*16));
  return SV(c.line.data()+(code&255),(code>>8)&255);
 }
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
@@ -432,7 +432,7 @@ int main(){
  vector<vector<Cand>> raw(workers*PARTS);
  for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t ch=0;ch<chunks.size();ch++){
   size_t tid=0;
@@ -448,13 +448,19 @@ int main(){
      uint64_t n,tag,aux1,aux2;
      bool compact=canonical_base36_id(f[0],'e',n) && line.size()<256;
      if(compact){
-      const int wanted[5]={1,2,4,5,6};
-      for(int z=0;z<5;z++)if(f[wanted[z]].size()>255 || f[wanted[z]].data()-line.data()>255)compact=false;
+      const int wanted[2]={1,5};
+      for(int z=0;z<2;z++)if(f[wanted[z]].size()>255 || f[wanted[z]].data()-line.data()>255)compact=false;
      }
      if(compact){
       tag=n;
-      uint16_t a=span_code(line,f[1]),b=span_code(line,f[2]),c=span_code(line,f[4]),d=span_code(line,f[5]),e=span_code(line,f[6]);
-      aux1=(uint64_t)a|((uint64_t)b<<16)|((uint64_t)c<<32)|((uint64_t)d<<48);aux2=e;
+      uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
+      int64_t ts;uint32_t toff=UINT32_MAX;
+      if(parse_time(f[2],ts)&&ts>=ws&&ts<we)toff=(uint32_t)(ts-ws);
+      uint32_t price_code=0;
+      if(tp==2){int32_t pv=parse_price(f[6]);if(pv>0)price_code=(uint32_t)pv;}
+      uint16_t user_code=span_code(line,f[1]),prod_code=span_code(line,f[5]);
+      aux1=(uint64_t)user_code|((uint64_t)prod_code<<16)|((uint64_t)toff<<32);
+      aux2=(uint64_t)price_code|((uint64_t)tp<<24);
      }else{
       tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
       aux1=(uint64_t)(uintptr_t)f[0].data();aux2=f[0].size();
@@ -501,23 +507,25 @@ int main(){
   pending.reserve(rows.size()/3+16);
   SV f[7];
   for(const Cand& c:rows){
-   SV user,tsv,type,prod,pricev;
+   SV user,prod;uint8_t tp;uint32_t t;int32_t price=0;
    if((c.idtag>>63)==0){
-    user=cand_span(c,0);tsv=cand_span(c,1);type=cand_span(c,2);prod=cand_span(c,3);pricev=cand_span(c,4);
+    user=cand_span16(c,0);prod=cand_span16(c,1);
+    t=(uint32_t)(c.aux1>>32);tp=(uint8_t)((c.aux2>>24)&3);
+    if(user.empty()||prod.empty()||tp==3||t==UINT32_MAX)continue;
+    if(c.ingest-(ws+(int64_t)t)>DAY)continue;
+    if(tp==2){price=(int32_t)(c.aux2&0xffffffu);if(price<=0)continue;}
    }else{
     if(!split_csv(c.line,7,f))continue;
-    user=f[1];tsv=f[2];type=f[4];prod=f[5];pricev=f[6];
+    user=f[1];prod=f[5];
+    tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
+    if(user.empty()||prod.empty()||tp==3)continue;
+    int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
+    t=(uint32_t)(ts-ws);
+    if(tp==2){price=parse_price(f[6]);if(price<=0)continue;}
    }
-   uint8_t tp=type=="purchase"?2:type=="cart"?1:type=="view"?0:3;
-   if(user.empty()||prod.empty()||tp==3)continue;
-   int64_t ts;if(!parse_time(tsv,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
-   int32_t price=0;uint16_t cat=unknown;
-   if(tp==2){
-    price=parse_price(pricev);if(price<=0)continue;
-    auto it=products.find(prod);if(it!=products.end())cat=it->second;
-   }
+   uint16_t cat=unknown;
+   if(tp==2){auto it=products.find(prod);if(it!=products.end())cat=it->second;}
    uint32_t p=person_map.find_only(user);
-   uint32_t t=(uint32_t)(ts-ws);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,cat,(uint8_t)(tp==2),0});
   }
