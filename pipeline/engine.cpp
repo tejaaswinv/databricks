@@ -557,7 +557,8 @@ int main(){
     if(tp==2){price=(int32_t)(c.aux2&0xffffffu);if(price<=0)continue;}
    }else{
     if(!split_csv(c.line,7,f))continue;
-    user=f[1];prod=f[5];user_hash=(uint32_t)Hash{}(user);
+    user=f[1];prod=f[5];
+    if(!canonical_base36_id(user,'u',uk))user_hash=(uint32_t)Hash{}(user);
     tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
     if(user.empty()||prod.empty()||tp==3)continue;
     int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
