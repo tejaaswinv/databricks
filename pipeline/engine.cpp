@@ -36,6 +36,16 @@ struct Hash { using is_transparent=void; size_t operator()(SV s) const { return 
 struct Eq {using is_transparent=void; bool operator()(SV a,SV b) const {return a==b;} };
 static bool byte_less(SV a,SV b) {return lexicographical_compare(a.begin(),a.end(),b.begin(),b.end(),[](char x,char y){return (unsigned char)x<(unsigned char)y;});}
 static bool digits(SV v) {if(v.empty())return false; for(unsigned char ch:v)if(ch<'0'||ch>'9')return false;return true;}
+static inline bool product_number(SV s,uint32_t& out){
+ if(s.size()<2||s.size()>7||s[0]!='p'||(s.size()>2&&s[1]=='0'))return false;
+ uint32_t v=0;for(size_t i=1;i<s.size();i++){unsigned char c=s[i];if(c<'0'||c>'9')return false;v=v*10+(c-'0');}
+ out=v;return true;
+}
+static inline bool campaign_number(SV s,uint32_t& out){
+ if(s.size()<3||s.size()>8||s[0]!='c'||s[1]!='_'||(s.size()>3&&s[2]=='0'))return false;
+ uint32_t v=0;for(size_t i=2;i<s.size();i++){unsigned char c=s[i];if(c<'0'||c>'9')return false;v=v*10+(c-'0');}
+ out=v;return true;
+}
 static bool canonical_base36_id(SV s,char prefix,uint64_t& out){
  if(s.size()<2||s[0]!=prefix||(s.size()>2&&s[1]=='0'))return false;
  uint64_t v=0;
@@ -413,15 +423,27 @@ int main(){
  vector<string> categories;
  auto cat_id=[&](SV s){auto it=cat_ids.find(s);if(it!=cat_ids.end())return it->second;uint16_t id=categories.size();categories.push_back(string(s));cat_ids.emplace(categories.back(),id);return id;};
  unordered_map<string,uint16_t,Hash,Eq> products;products.reserve(75000);
+ array<uint16_t,100000> product_fast;product_fast.fill(UINT16_MAX);
  {
-  Mapping m(data+"/products.csv");foreach_csv(m,2,[&](SV*f){products.emplace(string(f[0]),cat_id(f[1]));});
+  Mapping m(data+"/products.csv");foreach_csv(m,2,[&](SV*f){
+   uint16_t cat=cat_id(f[1]);products.emplace(string(f[0]),cat);
+   uint32_t n;if(product_number(f[0],n)&&n<product_fast.size())product_fast[n]=cat;
+  });
  }
  uint16_t unknown=cat_id("unknown");
  vector<string> campaigns,channels;
  unordered_map<string,uint16_t,Hash,Eq> campaign_ids;
+ array<uint16_t,10000> campaign_fast;campaign_fast.fill(UINT16_MAX);
  {
-  Mapping m(data+"/campaigns.csv");foreach_csv(m,2,[&](SV*f){uint16_t id=campaigns.size();campaigns.push_back(string(f[0]));channels.push_back(string(f[1]));campaign_ids.emplace(campaigns.back(),id);});
+  Mapping m(data+"/campaigns.csv");foreach_csv(m,2,[&](SV*f){
+   uint16_t id=campaigns.size();campaigns.push_back(string(f[0]));channels.push_back(string(f[1]));campaign_ids.emplace(campaigns.back(),id);
+   uint32_t n;if(campaign_number(f[0],n)&&n<campaign_fast.size())campaign_fast[n]=id;
+  });
  }
+ auto campaign_for=[&](SV x)->uint16_t{
+  uint32_t n;if(campaign_number(x,n)&&n<campaign_fast.size())return campaign_fast[n];
+  auto it=campaign_ids.find(x);return it==campaign_ids.end()?UINT16_MAX:it->second;
+ };
  uint16_t organic=campaigns.size();campaigns.push_back("organic");channels.push_back("organic");
  UnionFind dsu;
  for(auto&p:input_files(data+"/links")){maps.emplace_back(p);foreach_csv(maps.back(),2,[&](SV*f){if(!f[0].empty()&&!f[1].empty())dsu.join(f[0],f[1]);});}
@@ -513,7 +535,11 @@ int main(){
       if(parse_time(f[2],ts)&&ts>=ws&&ts<we)toff=(uint32_t)(ts-ws);
       uint32_t price_code=0;if(tp==2){int32_t pv=parse_price(f[6]);if(pv>0)price_code=(uint32_t)pv;}
       bool prod_empty=f[5].empty();uint16_t cat=unknown;
-      if(tp==2&&!prod_empty&&price_code){auto it=products.find(f[5]);if(it!=products.end())cat=it->second;}
+      if(tp==2&&!prod_empty&&price_code){
+       uint32_t pn;
+       if(product_number(f[5],pn)&&pn<product_fast.size())cat=product_fast[pn]==UINT16_MAX?unknown:product_fast[pn];
+       else {auto it=products.find(f[5]);if(it!=products.end())cat=it->second;}
+      }
       x0=(uk&MASK40)|((uint64_t)(toff&0xffffffU)<<40);
       x1=((uint64_t)(toff>>24)&0x7fULL)|((uint64_t)price_code<<7)|((uint64_t)cat<<31)|((uint64_t)tp<<47)|((uint64_t)prod_empty<<49);
      }else{
@@ -576,7 +602,11 @@ int main(){
     if(user.empty()||prod.empty()||tp==3)continue;
     int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
     t=(uint32_t)(ts-ws);
-    if(tp==2){price=parse_price(f[6]);if(price<=0)continue;auto it=products.find(prod);if(it!=products.end())cat=it->second;}
+    if(tp==2){
+     price=parse_price(f[6]);if(price<=0)continue;uint32_t pn;
+     if(product_number(prod,pn)&&pn<product_fast.size())cat=product_fast[pn]==UINT16_MAX?unknown:product_fast[pn];
+     else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
+    }
    }
    uint32_t p=(uk!=UINT64_MAX)?numeric_people.find(uk):person_map.find_hashed(user,user_hash);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
@@ -681,8 +711,8 @@ int main(){
   while(p<end){
    const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
    if(split_csv(SV(p,q-p),4,f)&&!f[0].empty()&&!f[1].empty()){
-    auto ci=campaign_ids.find(f[2]);
-    if(ci!=campaign_ids.end()){
+    uint16_t cid=campaign_for(f[2]);
+    if(cid!=UINT16_MAX){
      int64_t ts;
      if(parse_time(f[3],ts)&&ts>=ws-WEEK&&ts<we){
       uint64_t n,tag;
@@ -691,7 +721,7 @@ int main(){
       uint64_t uk;uint32_t person;
       if(canonical_base36_id(f[1],'u',uk))person=numeric_people.find(uk);
       else {size_t uh=Hash{}(f[1]);person=person_map.find_hashed(f[1],uh);}
-      click_raw[tid*CPARTS+((size_t)tag%CPARTS)].push_back({f[0],f[1],tag,(uint32_t)(ts-(ws-WEEK)),person,ci->second,0});
+      click_raw[tid*CPARTS+((size_t)tag%CPARTS)].push_back({f[0],f[1],tag,(uint32_t)(ts-(ws-WEEK)),person,cid,0});
      }
     }
    }
