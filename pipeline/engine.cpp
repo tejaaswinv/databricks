@@ -123,7 +123,13 @@ struct UnionFind{
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
-struct Cand{SV line,eventid;int64_t ingest;uint64_t idtag;}; // bit63=0 canonical numeric e-ID; bit63=1 hashed fallback
+struct Cand{SV line;uint64_t aux1,aux2;int64_t ingest;uint64_t idtag;}; // canonical: packed field spans; fallback: event-id ptr/len
+static inline SV cand_eventid(const Cand& c){return SV((const char*)(uintptr_t)c.aux1,(size_t)c.aux2);}
+static inline uint16_t span_code(SV line,SV f){return (uint16_t)((f.data()-line.data())|((uint16_t)f.size()<<8));}
+static inline SV cand_span(const Cand& c,int slot){
+ uint16_t code=slot<4?(uint16_t)(c.aux1>>(slot*16)):(uint16_t)c.aux2;
+ return SV(c.line.data()+(code&255),(code>>8)&255);
+}
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct ClickCand{SV clickid,user;uint64_t idtag;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
@@ -202,7 +208,7 @@ struct FlatEventIndex {
      }
      const Cand& old=rows[v-1];
      if(c.idtag==old.idtag){
-      if((c.idtag>>63)==0 || c.eventid==old.eventid)return v-1;
+      if((c.idtag>>63)==0 || cand_eventid(c)==cand_eventid(old))return v-1;
      }
      p=(p+1)&mask;
    }
@@ -426,10 +432,21 @@ int main(){
    const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
    SV line(p,q-p);
    if(split_csv(line,7,f)&&!f[0].empty()){
-     uint64_t n,tag;
-     if(canonical_base36_id(f[0],'e',n))tag=n;
-     else tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
-     raw[tid*PARTS+((size_t)tag%PARTS)].push_back({line,f[0],parse_ingest(f[3]),tag});
+     uint64_t n,tag,aux1,aux2;
+     bool compact=canonical_base36_id(f[0],'e',n) && line.size()<256;
+     if(compact){
+      const int wanted[5]={1,2,4,5,6};
+      for(int z=0;z<5;z++)if(f[wanted[z]].size()>255 || f[wanted[z]].data()-line.data()>255)compact=false;
+     }
+     if(compact){
+      tag=n;
+      uint16_t a=span_code(line,f[1]),b=span_code(line,f[2]),c=span_code(line,f[4]),d=span_code(line,f[5]),e=span_code(line,f[6]);
+      aux1=(uint64_t)a|((uint64_t)b<<16)|((uint64_t)c<<32)|((uint64_t)d<<48);aux2=e;
+     }else{
+      tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
+      aux1=(uint64_t)(uintptr_t)f[0].data();aux2=f[0].size();
+     }
+     raw[tid*PARTS+((size_t)tag%PARTS)].push_back({line,aux1,aux2,parse_ingest(f[3]),tag});
    }
    p=(q==end)?end:q+1;
   }
@@ -471,19 +488,25 @@ int main(){
   pending.reserve(rows.size()/3+16);
   SV f[7];
   for(const Cand& c:rows){
-   if(!split_csv(c.line,7,f))continue; // parsed once already; retained for exact winner reparse
-   uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-   if(f[1].empty()||f[5].empty()||tp==3)continue;
-   int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
+   SV user,tsv,type,prod,pricev;
+   if((c.idtag>>63)==0){
+    user=cand_span(c,0);tsv=cand_span(c,1);type=cand_span(c,2);prod=cand_span(c,3);pricev=cand_span(c,4);
+   }else{
+    if(!split_csv(c.line,7,f))continue;
+    user=f[1];tsv=f[2];type=f[4];prod=f[5];pricev=f[6];
+   }
+   uint8_t tp=type=="purchase"?2:type=="cart"?1:type=="view"?0:3;
+   if(user.empty()||prod.empty()||tp==3)continue;
+   int64_t ts;if(!parse_time(tsv,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
    int32_t price=0;uint16_t cat=unknown;
    if(tp==2){
-    price=parse_price(f[6]);if(price<=0)continue;
-    auto it=products.find(f[5]);if(it!=products.end())cat=it->second;
+    price=parse_price(pricev);if(price<=0)continue;
+    auto it=products.find(prod);if(it!=products.end())cat=it->second;
    }
-   uint32_t p=person_map.find_only(f[1]);
+   uint32_t p=person_map.find_only(user);
    uint32_t t=(uint32_t)(ts-ws);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
-   else pending.push_back({f[1],t,price,cat,(uint8_t)(tp==2),0});
+   else pending.push_back({user,t,price,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
  }
