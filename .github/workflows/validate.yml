@@ -29,7 +29,7 @@ jobs:
         run: python3 -m pip install --break-system-packages polars
       - name: Run 36 edge-case fixtures
         run: |
-          python3 starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- sh starter-duckdb/scripts/docker_run.sh
+          CPUS=4 MEM=7g python3 starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- sh starter-duckdb/scripts/docker_run.sh
       - name: Run official 1-million-event dev set
         run: |
           mkdir -p out
