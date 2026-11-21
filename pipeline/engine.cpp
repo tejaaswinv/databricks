@@ -24,6 +24,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #ifdef _OPENMP
 #include <parallel/algorithm>
 #include <omp.h>
@@ -104,8 +107,41 @@ struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
  ~Mapping(){if(p)munmap((void*)p,n);}
 };
 static vector<fs::path> input_files(const string& dir){vector<fs::path> files; if(!fs::exists(dir))return files;for(auto&e:fs::directory_iterator(dir))if(e.is_regular_file()&&e.path().extension()==".csv")files.push_back(e.path());sort(files.begin(),files.end());return files;}
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2"),noinline))
+static int split_plain_avx2(SV s,int n,SV*out){
+ const char* b=s.data();size_t len=s.size(),start=0,pos=0;int k=0;
+ const __m256i comma=_mm256_set1_epi8(','), quote=_mm256_set1_epi8('"');
+ for(;pos+32<=len;pos+=32){
+  __m256i v=_mm256_loadu_si256((const __m256i*)(b+pos));
+  uint32_t qm=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,quote));
+  if(qm)return -1;
+  uint32_t cm=(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,comma));
+  while(cm){
+   unsigned bit=(unsigned)__builtin_ctz(cm);size_t at=pos+bit;
+   if(k>=n-1)return 0;
+   out[k++]=SV(b+start,at-start);start=at+1;cm&=cm-1;
+  }
+ }
+ for(;pos<len;pos++){
+  char c=b[pos];if(c=='"')return -1;
+  if(c==','){
+   if(k>=n-1)return 0;
+   out[k++]=SV(b+start,pos-start);start=pos+1;
+  }
+ }
+ if(k!=n-1)return 0;out[k]=SV(b+start,len-start);return 1;
+}
+static inline bool cpu_avx2(){static const bool ok=__builtin_cpu_supports("avx2");return ok;}
+#endif
 static bool split_csv(SV s,int n,SV *out){
  if(s.empty())return false;
+#if defined(__x86_64__) || defined(_M_X64)
+ if(s.size()>=32 && cpu_avx2()){
+  int r=split_plain_avx2(s,n,out);
+  if(r>=0)return r!=0;
+ }
+#endif
  if(memchr(s.data(),'"',s.size())==nullptr){
   size_t from=0;
   for(int k=0;k<n;k++){
