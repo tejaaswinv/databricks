@@ -22,6 +22,6 @@ for tab, cols in {
              else "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions")
     schema = "{" + ",".join(f"'{x}':'VARCHAR'" for x in names.split(",")) + "}"
     con.execute(f"COPY (SELECT {cols} FROM read_csv('{path}', columns={schema}, "
-                f"auto_detect=false, header=true, delim=',', quote='\\\"', escape='\\\"', "
+                f"auto_detect=false, header=true, delim=',', "
                 f"new_line='\\n')) TO '{target}' (FORMAT PARQUET, COMPRESSION ZSTD)")
     (out/f"{tab}.csv").unlink()
