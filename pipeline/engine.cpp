@@ -422,12 +422,14 @@ int main(){
  unordered_map<string,uint16_t,Hash,Eq> cat_ids;
  vector<string> categories;
  auto cat_id=[&](SV s){auto it=cat_ids.find(s);if(it!=cat_ids.end())return it->second;uint16_t id=categories.size();categories.push_back(string(s));cat_ids.emplace(categories.back(),id);return id;};
- unordered_map<string,uint16_t,Hash,Eq> products;products.reserve(75000);
+ unordered_map<string,uint16_t,Hash,Eq> products;products.reserve(1024);
  array<uint16_t,100000> product_fast;product_fast.fill(UINT16_MAX);
  {
   Mapping m(data+"/products.csv");foreach_csv(m,2,[&](SV*f){
-   uint16_t cat=cat_id(f[1]);products.emplace(string(f[0]),cat);
-   uint32_t n;if(product_number(f[0],n)&&n<product_fast.size())product_fast[n]=cat;
+   uint16_t cat=cat_id(f[1]);uint32_t n;
+   if(product_number(f[0],n)&&n<product_fast.size()){
+    if(product_fast[n]==UINT16_MAX)product_fast[n]=cat;
+   }else products.emplace(string(f[0]),cat);
   });
  }
  uint16_t unknown=cat_id("unknown");
@@ -436,8 +438,10 @@ int main(){
  array<uint16_t,10000> campaign_fast;campaign_fast.fill(UINT16_MAX);
  {
   Mapping m(data+"/campaigns.csv");foreach_csv(m,2,[&](SV*f){
-   uint16_t id=campaigns.size();campaigns.push_back(string(f[0]));channels.push_back(string(f[1]));campaign_ids.emplace(campaigns.back(),id);
-   uint32_t n;if(campaign_number(f[0],n)&&n<campaign_fast.size())campaign_fast[n]=id;
+   uint16_t id=campaigns.size();campaigns.push_back(string(f[0]));channels.push_back(string(f[1]));uint32_t n;
+   if(campaign_number(f[0],n)&&n<campaign_fast.size()){
+    if(campaign_fast[n]==UINT16_MAX)campaign_fast[n]=id;
+   }else campaign_ids.emplace(campaigns.back(),id);
   });
  }
  auto campaign_for=[&](SV x)->uint16_t{
@@ -497,7 +501,7 @@ int main(){
   const char* first=header+1;
   if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(32,(span+4194303)/4194304));
+  size_t np=max<size_t>(1,min<size_t>(128,(span+262143)/262144));
   vector<const char*> bounds(np+1);
   bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){
@@ -690,7 +694,7 @@ int main(){
   const char* header=(const char*)memchr(m.p,'\n',m.n);if(!header)continue;
   const char* first=header+1;if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(32,(span+2097151)/2097152));
+  size_t np=max<size_t>(1,min<size_t>(64,(span+262143)/262144));
   vector<const char*> bounds(np+1);bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){const char* p=first+span*j/np;const char* q=(const char*)memchr(p,'\n',end-p);bounds[j]=q?q+1:end;}
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])click_chunks.push_back({bounds[j],bounds[j+1]});
