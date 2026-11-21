@@ -351,7 +351,7 @@ int main(){
   }
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])chunks.push_back({bounds[j],bounds[j+1]});
  }
- constexpr size_t PARTS=64;
+ constexpr size_t PARTS=16;
  const size_t workers=max(1,ncpu);
  vector<vector<Cand>> raw(workers*PARTS);
  for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
