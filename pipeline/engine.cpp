@@ -35,6 +35,19 @@ struct Hash { using is_transparent=void; size_t operator()(SV s) const { return 
 struct Eq {using is_transparent=void; bool operator()(SV a,SV b) const {return a==b;} };
 static bool byte_less(SV a,SV b) {return lexicographical_compare(a.begin(),a.end(),b.begin(),b.end(),[](char x,char y){return (unsigned char)x<(unsigned char)y;});}
 static bool digits(SV v) {if(v.empty())return false; for(unsigned char ch:v)if(ch<'0'||ch>'9')return false;return true;}
+static bool canonical_base36_id(SV s,char prefix,uint64_t& out){
+ if(s.size()<2||s[0]!=prefix||(s.size()>2&&s[1]=='0'))return false;
+ uint64_t v=0;
+ for(size_t i=1;i<s.size();i++){
+  unsigned char c=s[i];unsigned d;
+  if(c>='0'&&c<='9')d=c-'0';
+  else if(c>='a'&&c<='z')d=c-'a'+10;
+  else return false;
+  if(d>=36||v>((1ULL<<40)-1-d)/36)return false;
+  v=v*36+d;
+ }
+ out=v;return true;
+}
 static int64_t dnum(const char* p,int n) {int64_t x=0; for(int i=0;i<n;i++){if(p[i]<'0'||p[i]>'9')return -1; x=x*10+p[i]-'0';} return x;}
 static int64_t epoch_days(int y,int m,int d){ // Howard Hinnant: proleptic Gregorian
  y-=m<=2; int era=(y>=0 ? y:y-399)/400; unsigned yoe=(unsigned)(y-era*400); unsigned doy=(153*(m+(m>2?-3:9))+2)/5+d-1; unsigned yoe_days=yoe*365+yoe/4-yoe/100+doy; return int64_t(era)*146097+yoe_days-719468;
@@ -110,7 +123,7 @@ struct UnionFind{
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
-struct Cand{SV line,eventid;int64_t ingest;uint32_t h24;uint32_t unused=0;};
+struct Cand{SV line,eventid;int64_t ingest;uint64_t idtag;}; // bit63=0 canonical numeric e-ID; bit63=1 hashed fallback
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct ClickCand{SV clickid,user;uint32_t t;uint32_t person;uint32_t h24;uint16_t campaign;uint16_t unused=0;};
@@ -179,7 +192,7 @@ struct FlatEventIndex {
  uint32_t get_or_create(const Cand& c) {
    if(used*10>=buckets.size()*7)grow();
    size_t mask=buckets.size()-1;
-   size_t p=c.h24&mask;
+   size_t p=(size_t)c.idtag&mask;
    for(;;) {
      uint32_t v=buckets[p];
      if(!v) {
@@ -187,7 +200,10 @@ struct FlatEventIndex {
        buckets[p]=id+1;used++;
        return UINT32_MAX;
      }
-     if(rows[v-1].eventid==c.eventid)return v-1;
+     const Cand& old=rows[v-1];
+     if(c.idtag==old.idtag){
+      if((c.idtag>>63)==0 || c.eventid==old.eventid)return v-1;
+     }
      p=(p+1)&mask;
    }
  }
@@ -195,7 +211,7 @@ struct FlatEventIndex {
    vector<uint32_t> nb(buckets.size()*2,0);
    size_t mask=nb.size()-1;
    for(uint32_t v:buckets) if(v) {
-     size_t p=rows[v-1].h24&mask;
+     size_t p=(size_t)rows[v-1].idtag&mask;
      while(nb[p])p=(p+1)&mask;
      nb[p]=v;
    }
@@ -407,8 +423,10 @@ int main(){
    const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
    SV line(p,q-p);
    if(split_csv(line,7,f)&&!f[0].empty()){
-     size_t h=Hash{}(f[0]);
-     raw[tid*PARTS+(h%PARTS)].push_back({line,f[0],parse_ingest(f[3]),(uint32_t)h&0x00ffffffu,0});
+     uint64_t n,tag;
+     if(canonical_base36_id(f[0],'e',n))tag=n;
+     else tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
+     raw[tid*PARTS+((size_t)tag%PARTS)].push_back({line,f[0],parse_ingest(f[3]),tag});
    }
    p=(q==end)?end:q+1;
   }
