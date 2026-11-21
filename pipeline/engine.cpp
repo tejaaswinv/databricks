@@ -497,7 +497,7 @@ int main(){
   const char* first=header+1;
   if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(128,(span+262143)/262144));
+  size_t np=max<size_t>(1,min<size_t>(32,(span+4194303)/4194304));
   vector<const char*> bounds(np+1);
   bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){
@@ -690,7 +690,7 @@ int main(){
   const char* header=(const char*)memchr(m.p,'\n',m.n);if(!header)continue;
   const char* first=header+1;if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(64,(span+262143)/262144));
+  size_t np=max<size_t>(1,min<size_t>(32,(span+2097151)/2097152));
   vector<const char*> bounds(np+1);bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){const char* p=first+span*j/np;const char* q=(const char*)memchr(p,'\n',end-p);bounds[j]=q?q+1:end;}
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])click_chunks.push_back({bounds[j],bounds[j+1]});
