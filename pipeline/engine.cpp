@@ -277,49 +277,97 @@ int main(){
  auto person_for=[&](SV name)->uint32_t{return person_map.get(name);};
  cerr<<"links nodes="<<dsu.nodes.size()<<"\n";
  // Event dedup happens before *all* event validation.
- vector<Cand> candidates;
- // Sample a few raw lines to avoid expensive vector reallocations and hash rehashes
- // at 20-60 million events; no data content or generator shape is assumed.
+ // Batch parse in parallel, then independently deduplicate by exact event ID.
  auto event_paths=input_files(data+"/events");
  uint64_t total_bytes=0, sample_bytes=0, sample_lines=0;
  for(const auto&p:event_paths)total_bytes+=fs::file_size(p);
  for(const auto&p:event_paths){
   if(sample_lines>=5000)break;
-  ifstream f(p,ios::binary);string line;getline(f,line); // header
+  ifstream f(p,ios::binary);string line;getline(f,line);
   while(sample_lines<5000 && getline(f,line)){sample_bytes+=line.size()+1;sample_lines++;}
  }
  size_t event_capacity=2000000;
- if(sample_lines&&sample_bytes){event_capacity=max<size_t>(1000, (long double)total_bytes*sample_lines/sample_bytes*1.05L);}
- candidates.reserve(event_capacity);
- FlatEventIndex event_idx(candidates,event_capacity);
+ if(sample_lines&&sample_bytes)event_capacity=max<size_t>(1000,(long double)total_bytes*sample_lines/sample_bytes*1.05L);
+ struct Work{const char* begin;const char* end;};
+ vector<Work> chunks;
  for(auto&p:event_paths){
-  maps.emplace_back(p);
-  foreach_csv(maps.back(),7,[&](SV*f){
-    if(f[0].empty())return;
-    int64_t ing=parse_ingest(f[3]); // ingest guaranteed F1 by the problem spec
-    uint32_t ix=event_idx.get_or_create(f[0]);
-    if(ix==UINT32_MAX){
-      uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-      candidates.push_back({f[0],f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp});
-    } else if(ing<candidates[ix].ingest){
-      uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-      candidates[ix]={f[0],f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp};
-    }
-  });
- }
- event_idx.buckets.clear();event_idx.buckets.shrink_to_fit();
- vector<Evt> events;events.reserve(candidates.size());
- for(const Cand& c:candidates){
-  if(c.user.empty()||c.prod.empty()||c.type==3)continue;
-  int64_t ts;if(!parse_time(c.ts,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
-  int32_t price=0;uint16_t cat=unknown;
-  if(c.type==2){
-   if(c.price<=0)continue;
-   price=c.price;auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
+  maps.emplace_back(p);const auto&m=maps.back();
+  if(!m.n)continue;
+  const char* end=m.p+m.n;
+  const char* header=(const char*)memchr(m.p,'\n',m.n);
+  if(!header)continue;
+  const char* first=header+1;
+  if(first==end)continue;
+  size_t span=end-first;
+  size_t np=max<size_t>(1,min<size_t>(128,(span+262143)/262144));
+  vector<const char*> bounds(np+1);
+  bounds[0]=first;bounds[np]=end;
+  for(size_t j=1;j<np;j++){
+   const char* p=first+span*j/np;
+   const char* q=(const char*)memchr(p,'\n',end-p);
+   bounds[j]=q?q+1:end;
   }
-  events.push_back({ts,person_for(c.user),price,cat,(uint8_t)(c.type==2),0});
+  for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])chunks.push_back({bounds[j],bounds[j+1]});
  }
- vector<Cand>().swap(candidates);
+ constexpr size_t PARTS=16;
+ const size_t workers=max(1,ncpu);
+ vector<vector<Cand>> raw(workers*PARTS);
+ for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t ch=0;ch<chunks.size();ch++){
+  size_t tid=0;
+#ifdef _OPENMP
+  tid=(size_t)omp_get_thread_num();
+#endif
+  const char* p=chunks[ch].begin;const char* end=chunks[ch].end;
+  SV f[7];
+  while(p<end){
+   const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
+   if(split_csv(SV(p,q-p),7,f)&&!f[0].empty()){
+     size_t h=hash<SV>{}(f[0]);
+     uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
+     raw[tid*PARTS+(h%PARTS)].push_back({f[0],f[1],f[2],f[5],parse_ingest(f[3]),(tp==2?parse_price(f[6]):0),tp});
+   }
+   p=(q==end)?end:q+1;
+  }
+ }
+ vector<vector<Cand>> unique(PARTS);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t part=0;part<PARTS;part++){
+  size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
+  vector<Cand> cands;cands.reserve(n);
+  FlatEventIndex idx(cands,n);
+  for(size_t t=0;t<workers;t++){
+   auto& rows=raw[t*PARTS+part];
+   for(const Cand& c:rows){
+      uint32_t ix=idx.get_or_create(c.eventid);
+      if(ix==UINT32_MAX)cands.push_back(c);
+      else if(c.ingest<cands[ix].ingest)cands[ix]=c;
+   }
+   vector<Cand>().swap(rows);
+  }
+  unique[part]=move(cands);
+ }
+ vector<vector<Cand>>().swap(raw);
+ vector<Evt> events;events.reserve(event_capacity);
+ for(auto& rows:unique){
+  for(const Cand& c:rows){
+   if(c.user.empty()||c.prod.empty()||c.type==3)continue;
+   int64_t ts;if(!parse_time(c.ts,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
+   int32_t price=0;uint16_t cat=unknown;
+   if(c.type==2){
+    if(c.price<=0)continue;
+    price=c.price;auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
+   }
+   events.push_back({ts,person_for(c.user),price,cat,(uint8_t)(c.type==2),0});
+  }
+  vector<Cand>().swap(rows);
+ }
+ vector<vector<Cand>>().swap(unique);
  cerr<<"valid events="<<events.size()<<" people="<<people.size()<<"\n";
  // Clicks: identical duplicates can safely be deduped after validation.
  vector<Click> clicks;clicks.reserve(max<size_t>(1000,events.size()/4));
