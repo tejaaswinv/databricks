@@ -24,7 +24,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <duckdb.h>
 #ifdef _OPENMP
 #include <parallel/algorithm>
 #include <omp.h>
@@ -883,24 +882,6 @@ int main(){
   }
  }
  lap("csv_output");
- // Final Parquet emission in-process: avoids spawning a second DuckDB process.
- duckdb_database db=nullptr;duckdb_connection con=nullptr;duckdb_result qr;
- if(duckdb_open(nullptr,&db)!=DuckDBSuccess)fail("duckdb_open failed");
- if(duckdb_connect(db,&con)!=DuckDBSuccess){duckdb_close(&db);fail("duckdb_connect failed");}
- auto dq=[&](const string& sql){
-  if(duckdb_query(con,sql.c_str(),&qr)!=DuckDBSuccess){
-   string msg=duckdb_result_error(&qr)?duckdb_result_error(&qr):"duckdb query failed";
-   duckdb_destroy_result(&qr);fail(msg);
-  }
-  duckdb_destroy_result(&qr);
- };
- fs::create_directories(out+"/user_daily");fs::create_directories(out+"/campaign_daily");
- dq("SET threads="+to_string(max(1,ncpu)));
- dq("COPY (SELECT * FROM read_csv('"+out+"/user_daily.csv', columns={'user_id':'VARCHAR','day':'DATE','sessions':'BIGINT','events':'BIGINT','revenue_cents':'BIGINT','top_category':'VARCHAR'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+out+"/user_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
- dq("COPY (SELECT * FROM read_csv('"+out+"/campaign_daily.csv', columns={'campaign_id':'VARCHAR','channel':'VARCHAR','day':'DATE','sessions':'BIGINT','purchasing_sessions':'BIGINT','revenue_cents':'BIGINT','assisted_sessions':'BIGINT'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+out+"/campaign_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
- duckdb_disconnect(&con);duckdb_close(&db);
- fs::remove(out+"/user_daily.csv");fs::remove(out+"/campaign_daily.csv");
- lap("parquet_output");
  cerr<<"engine time="<<chrono::duration<double>(chrono::steady_clock::now()-t0).count()<<"s\n";
  return 0;
 }
