@@ -8,15 +8,14 @@ mkdir -p "$OUTPUT_DIR/user_daily" "$OUTPUT_DIR/campaign_daily"
 rm -f "$OUTPUT_DIR/user_daily.csv" "$OUTPUT_DIR/campaign_daily.csv"
 mkfifo "$OUTPUT_DIR/user_daily.csv" "$OUTPUT_DIR/campaign_daily.csv"
 
-threads="${NCPU:-8}"
 mem="${MEM_GB:-24}"
 
-# Start both Parquet consumers before the engine. They block on the FIFOs while
-# native parsing/sessionization runs, hiding DuckDB startup and avoiding disk CSV I/O.
-/app/duckdb -batch -c "
-SET threads = $threads;
+# Warm DuckDB in parallel at low priority, but keep it single-threaded so the
+# native engine owns the CPUs. It blocks on user_daily until final emission.
+nice -n 19 /app/duckdb -batch -c "
+SET threads = 1;
 SET memory_limit = '$((mem * 4 / 10))GB';
-SET temp_directory = '$SCRATCH_DIR/duckdb_user_tmp';
+SET temp_directory = '$SCRATCH_DIR/duckdb_tmp';
 COPY (
   SELECT * FROM read_csv(
     '$OUTPUT_DIR/user_daily.csv',
@@ -24,13 +23,6 @@ COPY (
     auto_detect=false, header=true, delim=',', new_line='\\n', parallel=false
   )
 ) TO '$OUTPUT_DIR/user_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY);
-" >/dev/null &
-pid_user=$!
-
-/app/duckdb -batch -c "
-SET threads = $threads;
-SET memory_limit = '$((mem * 4 / 10))GB';
-SET temp_directory = '$SCRATCH_DIR/duckdb_campaign_tmp';
 COPY (
   SELECT * FROM read_csv(
     '$OUTPUT_DIR/campaign_daily.csv',
@@ -39,11 +31,10 @@ COPY (
   )
 ) TO '$OUTPUT_DIR/campaign_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY);
 " >/dev/null &
-pid_campaign=$!
+pid_duck=$!
 
 status=0
 /app/engine || status=$?
-wait "$pid_user" || status=$?
-wait "$pid_campaign" || status=$?
+wait "$pid_duck" || status=$?
 rm -f "$OUTPUT_DIR/user_daily.csv" "$OUTPUT_DIR/campaign_daily.csv"
 exit "$status"
