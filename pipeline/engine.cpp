@@ -95,16 +95,23 @@ struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
 static vector<fs::path> input_files(const string& dir){vector<fs::path> files; if(!fs::exists(dir))return files;for(auto&e:fs::directory_iterator(dir))if(e.is_regular_file()&&e.path().extension()==".csv")files.push_back(e.path());sort(files.begin(),files.end());return files;}
 static bool split_csv(SV s,int n,SV *out){
  if(s.empty())return false;
- size_t from=0;for(int k=0;k<n;k++){
-  size_t pos=s.find(',',from);
-  if(k==n-1){if(pos!=SV::npos)return false;pos=s.size();}
-  else if(pos==SV::npos)return false;
-  SV v=s.substr(from,pos-from);
-  if(!v.empty()&&v.front()=='"'){if(v.size()<2||v.back()!='"')return false;v.remove_prefix(1);v.remove_suffix(1);}
-  if(v.find('"')!=SV::npos)return false;
-  out[k]=v;from=pos+1;
+ const char* base=s.data();const char* p=base;const char* end=base+s.size();const char* start=p;
+ int k=0;uint8_t quotes=0;const char* firstq=nullptr;const char* lastq=nullptr;
+ auto finish=[&](const char* stop)->bool{
+  if(k>=n)return false;
+  SV v(start,(size_t)(stop-start));
+  if(quotes==0)out[k++]=v;
+  else if(quotes==2&&firstq==start&&lastq==stop-1&&v.size()>=2){v.remove_prefix(1);v.remove_suffix(1);out[k++]=v;}
+  else return false;
+  quotes=0;firstq=lastq=nullptr;return true;
+ };
+ for(;p<end;p++){
+  char ch=*p;
+  if(ch==','){if(!finish(p))return false;start=p+1;}
+  else if(ch=='"'){if(quotes==0)firstq=p;lastq=p;if(quotes<3)quotes++;else quotes=3;}
  }
- return true;
+ if(!finish(end))return false;
+ return k==n;
 }
 template<class F>static void foreach_csv(const Mapping&m,int n,F action){
  if(!m.n)return;
