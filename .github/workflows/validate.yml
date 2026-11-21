@@ -20,16 +20,14 @@ jobs:
           unzip -q /tmp/starter.zip
           unzip -q /tmp/generator.zip
           unzip -q /tmp/answer.zip
-      - name: Inspect generator ID encoding
+      - name: Inspect generator seed/key derivation
         run: |
-          echo '=== text.rs base36/scramble ==='
-          sed -n '185,235p' generator/src/text.rs
-          echo '=== user.rs event ids ==='
-          sed -n '295,330p' generator/src/user.rs
-          echo '=== user.rs click ids ==='
-          sed -n '445,475p' generator/src/user.rs
-          echo '=== dataset keys ==='
-          grep -RInE 'event_key|click_key|user_key|struct Dataset' generator/src | head -n 100
+          echo '=== random.rs ==='
+          sed -n '1,260p' generator/src/random.rs
+          echo '=== plan.rs dataset construction ==='
+          sed -n '85,175p' generator/src/plan.rs
+          echo '=== main args/seed ==='
+          sed -n '1,120p' generator/src/main.rs
       - name: Build official generator
         run: |
           cargo --version
