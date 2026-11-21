@@ -20,6 +20,10 @@ jobs:
           unzip -q /tmp/starter.zip
           unzip -q /tmp/generator.zip
           unzip -q /tmp/answer.zip
+      - name: Inspect generator ID encoding
+        run: |
+          echo '=== generator ID-related source ==='
+          grep -RInE 'event_id|click_id|base36|scram|encode|fn .*id|to_radix|radix' generator/src generator/*.rs 2>/dev/null | head -n 220 || true
       - name: Build official generator
         run: |
           cargo --version
