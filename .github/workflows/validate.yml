@@ -20,10 +20,6 @@ jobs:
           unzip -q /tmp/starter.zip
           unzip -q /tmp/generator.zip
           unzip -q /tmp/answer.zip
-      - name: Inspect bad-user generation
-        run: |
-          echo '=== user_field bad-user logic ==='
-          sed -n '520,555p' generator/src/user.rs
       - name: Build official generator
         run: |
           cargo --version
@@ -44,6 +40,8 @@ jobs:
       - name: A/B benchmark current vs previous optimized commit
         run: |
           generator/target/release/generate --seed 7 --events 5000000 --clicks 1250000 --output bench
+          echo '=== identity debug ==='
+          grep -R -n -E 'u446ixr2x|u55bycocp|u6sxw5md8|u7vfkixf|u84zxmltz|uc6q8ye96' bench/links bench/events bench/clicks 2>/dev/null | head -n 120 || true
           git worktree add --detach /tmp/baseline f93198872ce31f6920c698f71a5a607fb71a8af4
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
 
