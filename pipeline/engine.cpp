@@ -107,6 +107,7 @@ struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
+struct PendingEvt{SV user;uint32_t t;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused=0;};
 struct CampDay{int64_t sessions=0,purchasing=0,revenue=0,assists=0;};
 // Open-addressing dedup index: cache-friendly, compact, collision-safe.
 // An entry stores the 1-based index into Cand; full keys are compared on match.
@@ -134,6 +135,14 @@ struct FastPeople {
   size_t p=hash<SV>{}(key)&(buckets.size()-1);
   while(!buckets[p].key.empty())p=(p+1)&(buckets.size()-1);
   buckets[p]={key,person};used++;
+ }
+ uint32_t find_only(SV key) const {
+  size_t p=hash<SV>{}(key)&(buckets.size()-1);
+  while(!buckets[p].key.empty()) {
+    if(buckets[p].key==key)return buckets[p].person;
+    p=(p+1)&(buckets.size()-1);
+  }
+  return UINT32_MAX;
  }
  uint32_t get(SV key) {
   if(used*10>=buckets.size()*7)grow();
@@ -398,8 +407,19 @@ int main(){
   unique[part]=move(cands);
  }
  vector<vector<Cand>>().swap(raw);lap("event_dedup");
- vector<Evt> events;events.reserve(event_capacity);
- for(auto& rows:unique){
+ // Validate winners in parallel. The linked-ID table is immutable here, so its lookups
+ // are thread-safe. Only IDs absent from links are deferred for sequential insertion.
+ vector<vector<Evt>> valid_by_part(PARTS);
+ vector<vector<PendingEvt>> pending_by_part(PARTS);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t part=0;part<PARTS;part++){
+  auto& rows=unique[part];
+  auto& good=valid_by_part[part];
+  auto& pending=pending_by_part[part];
+  good.reserve(rows.size());
+  pending.reserve(rows.size()/3+16);
   for(const Cand& c:rows){
    if(c.user.empty()||c.prod.empty()||c.type==3)continue;
    int64_t ts;if(!parse_time(c.ts,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
@@ -408,12 +428,25 @@ int main(){
     if(c.price<=0)continue;
     price=c.price;auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
    }
-   events.push_back({(uint32_t)(ts-ws),person_for(c.user),price,cat,(uint8_t)(c.type==2),0});
+   uint32_t p=person_map.find_only(c.user);
+   uint32_t t=(uint32_t)(ts-ws);
+   if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(c.type==2),0});
+   else pending.push_back({c.user,t,price,cat,(uint8_t)(c.type==2),0});
   }
   vector<Cand>().swap(rows);
  }
  vector<vector<Cand>>().swap(unique);
- cerr<<"valid events="<<events.size()<<" people="<<people.size()<<"\n";lap("event_validate");
+ size_t good_n=0,pending_n=0;
+ for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();}
+ vector<Evt> events;events.reserve(good_n+pending_n);
+ for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
+ vector<vector<Evt>>().swap(valid_by_part);
+ for(auto& v:pending_by_part){
+  for(const PendingEvt& e:v)events.push_back({e.t,person_for(e.user),e.price,e.category,e.is_purchase,0});
+  vector<PendingEvt>().swap(v);
+ }
+ vector<vector<PendingEvt>>().swap(pending_by_part);
+ cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<pending_n<<"\n";lap("event_validate");
  // Clicks: identical duplicates can safely be deduped after validation.
  vector<Click> clicks;clicks.reserve(max<size_t>(1000,events.size()/4));
  FlatClickSet click_seen(clicks,max<size_t>(1000,events.size()/4));
