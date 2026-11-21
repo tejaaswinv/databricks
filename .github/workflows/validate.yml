@@ -40,12 +40,17 @@ jobs:
       - name: A/B benchmark current vs 15.71-second baseline
         run: |
           generator/target/release/generate --seed 7 --events 5000000 --clicks 1250000 --output bench
-          rm -rf bench-current bench-base
-          mkdir bench-current bench-base
-          echo "=== current ==="
-          /usr/bin/time -f 'CURRENT_WALL=%e' env IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench bench-current
           git worktree add --detach /tmp/baseline 4894600c9bd67e7532245e51014417148f00ca53
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
+
+          # Warm both images so timing is not dominated by first-read filesystem cache.
+          rm -rf warm-current warm-base && mkdir warm-current warm-base
+          env IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench warm-current >/dev/null
+          env IMAGE=shopping-sessions:baseline CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench warm-base >/dev/null
+
+          rm -rf bench-current bench-base && mkdir bench-current bench-base
+          echo "=== current ==="
+          /usr/bin/time -f 'CURRENT_WALL=%e' env IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench bench-current
           echo "=== baseline ==="
           /usr/bin/time -f 'BASELINE_WALL=%e' env IMAGE=shopping-sessions:baseline CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench bench-base
           python3 starter-duckdb/scripts/compare.py bench-current bench-base
