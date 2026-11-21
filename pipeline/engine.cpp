@@ -100,7 +100,7 @@ struct UnionFind{
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
-struct Cand{SV eventid, user, ts, prod; int64_t ingest; int32_t price; uint8_t type;};
+struct Cand{SV eventid, user, ts, prod; int64_t ingest; int32_t price; uint32_t meta;}; // meta: low 8 type, high 24 cached hash
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
@@ -165,10 +165,10 @@ struct FlatEventIndex {
    size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
    buckets.assign(cap,0);
  }
- uint32_t get_or_create(SV key) {
+ uint32_t get_or_create(const Cand& c) {
    if(used*10>=buckets.size()*7)grow();
    size_t mask=buckets.size()-1;
-   size_t p=hash<SV>{}(key)&mask;
+   size_t p=(c.meta>>8)&mask;
    for(;;) {
      uint32_t v=buckets[p];
      if(!v) {
@@ -176,7 +176,7 @@ struct FlatEventIndex {
        buckets[p]=id+1;used++;
        return UINT32_MAX;
      }
-     if(rows[v-1].eventid==key)return v-1;
+     if(rows[v-1].eventid==c.eventid)return v-1;
      p=(p+1)&mask;
    }
  }
@@ -184,7 +184,7 @@ struct FlatEventIndex {
    vector<uint32_t> nb(buckets.size()*2,0);
    size_t mask=nb.size()-1;
    for(uint32_t v:buckets) if(v) {
-     size_t p=hash<SV>{}(rows[v-1].eventid)&mask;
+     size_t p=(rows[v-1].meta>>8)&mask;
      while(nb[p])p=(p+1)&mask;
      nb[p]=v;
    }
@@ -381,7 +381,8 @@ int main(){
    if(split_csv(SV(p,q-p),7,f)&&!f[0].empty()){
      size_t h=hash<SV>{}(f[0]);
      uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-     raw[tid*PARTS+(h%PARTS)].push_back({f[0],f[1],f[2],f[5],parse_ingest(f[3]),(tp==2?parse_price(f[6]):0),tp});
+     uint32_t meta=((uint32_t(h)&0x00ffffffu)<<8)|tp;
+     raw[tid*PARTS+(h%PARTS)].push_back({f[0],f[1],f[2],f[5],parse_ingest(f[3]),(tp==2?parse_price(f[6]):0),meta});
    }
    p=(q==end)?end:q+1;
   }
@@ -398,7 +399,7 @@ int main(){
   for(size_t t=0;t<workers;t++){
    auto& rows=raw[t*PARTS+part];
    for(const Cand& c:rows){
-      uint32_t ix=idx.get_or_create(c.eventid);
+      uint32_t ix=idx.get_or_create(c);
       if(ix==UINT32_MAX)cands.push_back(c);
       else if(c.ingest<cands[ix].ingest)cands[ix]=c;
    }
@@ -421,17 +422,17 @@ int main(){
   good.reserve(rows.size());
   pending.reserve(rows.size()/3+16);
   for(const Cand& c:rows){
-   if(c.user.empty()||c.prod.empty()||c.type==3)continue;
+   if(c.user.empty()||c.prod.empty()||(uint8_t)(c.meta&0xff)==3)continue;
    int64_t ts;if(!parse_time(c.ts,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
    int32_t price=0;uint16_t cat=unknown;
-   if(c.type==2){
+   if((uint8_t)(c.meta&0xff)==2){
     if(c.price<=0)continue;
     price=c.price;auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
    }
    uint32_t p=person_map.find_only(c.user);
    uint32_t t=(uint32_t)(ts-ws);
-   if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(c.type==2),0});
-   else pending.push_back({c.user,t,price,cat,(uint8_t)(c.type==2),0});
+   if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)((uint8_t)(c.meta&0xff)==2),0});
+   else pending.push_back({c.user,t,price,cat,(uint8_t)((uint8_t)(c.meta&0xff)==2),0});
   }
   vector<Cand>().swap(rows);
  }
