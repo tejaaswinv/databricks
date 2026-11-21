@@ -1,0 +1,37 @@
+name: Validate shopping sessions
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download official public test inputs
+        run: |
+          curl -fsSL --retry 3 'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip' -o /tmp/starter.zip
+          curl -fsSL --retry 3 'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip' -o /tmp/generator.zip
+          curl -fsSL --retry 3 'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip' -o /tmp/answer.zip
+          unzip -q /tmp/starter.zip
+          unzip -q /tmp/generator.zip
+          unzip -q /tmp/answer.zip
+      - name: Build official generator
+        run: |
+          cargo --version
+          cargo build --release --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+      - name: Build submission image
+        run: docker build --platform linux/amd64 -t shopping-sessions:latest .
+      - name: Install official checker dependency
+        run: python3 -m pip install --break-system-packages polars
+      - name: Run 36 edge-case fixtures
+        run: |
+          python3 starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- sh starter-duckdb/scripts/docker_run.sh
+      - name: Run official 1-million-event dev set
+        run: |
+          mkdir -p out
+          IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh dev out
+          python3 starter-duckdb/scripts/compare.py out dev-answer
