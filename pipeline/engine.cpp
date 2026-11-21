@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <charconv>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <string_view>
@@ -442,10 +444,48 @@ int main(){
  vector<Evt> events;events.reserve(good_n+pending_n);
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
- for(auto& v:pending_by_part){
-  for(const PendingEvt& e:v)events.push_back({e.t,person_for(e.user),e.price,e.category,e.is_purchase,0});
-  vector<PendingEvt>().swap(v);
+ // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
+ // so assignment order is irrelevant; every equal byte string still gets exactly one person.
+ constexpr size_t ID_SHARDS=256;
+ array<unordered_map<SV,uint32_t,Hash,Eq>,ID_SHARDS> standalone;
+ array<mutex,ID_SHARDS> standalone_mu;
+ size_t per_shard=max<size_t>(16,pending_n/24/ID_SHARDS+8);
+ for(auto& m:standalone)m.reserve(per_shard);
+ uint32_t people_base=(uint32_t)people.size();
+ people.resize((size_t)people_base+pending_n);
+ atomic<uint32_t> next_person(people_base);
+ vector<vector<Evt>> resolved_pending(PARTS);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t part=0;part<PARTS;part++){
+  auto& src=pending_by_part[part];
+  auto& dst=resolved_pending[part];
+  dst.reserve(src.size());
+  for(const PendingEvt& e:src){
+   size_t h=Hash{}(e.user), sh=h&(ID_SHARDS-1);
+   uint32_t p;
+   {
+    lock_guard<mutex> lock(standalone_mu[sh]);
+    auto& m=standalone[sh];
+    auto it=m.find(e.user);
+    if(it==m.end()){
+     p=next_person.fetch_add(1,memory_order_relaxed);
+     m.emplace(e.user,p);
+     people[p]=e.user;
+    }else p=it->second;
+   }
+   dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
+  }
+  vector<PendingEvt>().swap(src);
  }
+ uint32_t final_people=next_person.load(memory_order_relaxed);
+ people.resize(final_people);
+ // Make the newly assigned IDs available to click processing. This is once per unique
+ // ID rather than once per event.
+ for(uint32_t p=people_base;p<final_people;p++)person_map.add_link(people[p],p);
+ for(auto& v:resolved_pending){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
+ vector<vector<Evt>>().swap(resolved_pending);
  vector<vector<PendingEvt>>().swap(pending_by_part);
  cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<pending_n<<"\n";lap("event_validate");
  // Clicks: identical duplicates can safely be deduped after validation.
