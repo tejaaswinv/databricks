@@ -37,10 +37,10 @@ jobs:
           mkdir -p out
           IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh dev out
           python3 starter-duckdb/scripts/compare.py out dev-answer
-      - name: A/B benchmark current vs 15.71-second baseline
+      - name: A/B benchmark current vs previous optimized commit
         run: |
           generator/target/release/generate --seed 7 --events 5000000 --clicks 1250000 --output bench
-          git worktree add --detach /tmp/baseline 4894600c9bd67e7532245e51014417148f00ca53
+          git worktree add --detach /tmp/baseline 66481f8f6feec55017769c912c5d72350949b37f
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
 
           # Warm both images so timing is not dominated by first-read filesystem cache.
