@@ -81,12 +81,20 @@ static bool parse_time(SV s,int64_t &val){
  if(s.size()==25 && ((p[19]!='+'&&p[19]!='-')||p[22]!=':'))return false;
  int y=dnum(p,4),m=dnum(p+5,2),d=dnum(p+8,2),h=dnum(p+11,2),mi=dnum(p+14,2),se=dnum(p+17,2);
  if(y<1||m<1||m>12||d<1||h>23||mi>59||se>59||h<0||mi<0||se<0)return false;
- int md[12]={31,28,31,30,31,30,31,31,30,31,30,31};
- if(m==2 && (y%4==0 && (y%100!=0||y%400==0)))md[1]=29;
- if(d>md[m-1])return false;
+ struct DateHit{uint32_t key=0;int64_t midnight=0;};
+ static thread_local DateHit dates[64];
+ uint32_t key=(uint32_t(y)<<9)|(uint32_t(m)<<5)|uint32_t(d);
+ DateHit &hit=dates[key&63];int64_t midnight;
+ if(hit.key==key)midnight=hit.midnight;
+ else{
+  int md[12]={31,28,31,30,31,30,31,31,30,31,30,31};
+  if(m==2 && (y%4==0 && (y%100!=0||y%400==0)))md[1]=29;
+  if(d>md[m-1])return false;
+  midnight=epoch_days(y,m,d)*DAY;hit={key,midnight};
+ }
  int offset=0;
  if(s.size()==25){int oh=dnum(p+20,2),om=dnum(p+23,2);if(oh>23||om>59||oh<0||om<0)return false;offset=oh*60+om;if(p[19]=='-')offset=-offset;}
- val=(epoch_days(y,m,d)*86400LL + h*3600+mi*60+se-int64_t(offset)*60)*1000;
+ val=midnight+(h*3600LL+mi*60LL+se-int64_t(offset)*60)*1000;
  return true;
 }
 static int32_t epoch_day(int64_t ts){int64_t d=ts/DAY; if(ts<0 && ts%DAY)d--;return (int32_t)d;}
@@ -522,7 +530,7 @@ int main(){
   }
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])chunks.push_back({bounds[j],bounds[j+1]});
  }
- constexpr size_t PARTS=256;
+ constexpr size_t PARTS=16;
  const size_t workers=max(1,ncpu);
  vector<vector<Cand>> raw(workers*PARTS);
  for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
