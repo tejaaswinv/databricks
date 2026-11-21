@@ -20,14 +20,6 @@ jobs:
           unzip -q /tmp/starter.zip
           unzip -q /tmp/generator.zip
           unzip -q /tmp/answer.zip
-      - name: Inspect generator seed/key derivation
-        run: |
-          echo '=== random.rs ==='
-          sed -n '1,260p' generator/src/random.rs
-          echo '=== plan.rs dataset construction ==='
-          sed -n '85,175p' generator/src/plan.rs
-          echo '=== main args/seed ==='
-          sed -n '1,120p' generator/src/main.rs
       - name: Build official generator
         run: |
           cargo --version
@@ -48,7 +40,7 @@ jobs:
       - name: A/B benchmark current vs previous optimized commit
         run: |
           generator/target/release/generate --seed 7 --events 5000000 --clicks 1250000 --output bench
-          git worktree add --detach /tmp/baseline d3f802bbd517e6fc1ebb57f813121b54cac70570
+          git worktree add --detach /tmp/baseline f93198872ce31f6920c698f71a5a607fb71a8af4
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
 
           # Warm both images so timing is not dominated by first-read filesystem cache.
