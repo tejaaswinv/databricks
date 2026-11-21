@@ -272,12 +272,25 @@ static int32_t parse_price(SV s) {
  return v>0?v:-1;
 }
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
-static void write_field(ostream&os,SV s){
- // Values may contain a CR or quotes by spec? CSV field value cannot contain quotes or commas, CR is allowed.
- // Quote CR so a downstream CSV reader doesn't treat it as part of the terminator.
- if(s.find('\r')==SV::npos){os.write(s.data(),s.size());return;}
- os.put('"');os.write(s.data(),s.size());os.put('"');
-}
+struct FastOut{
+ FILE* f=nullptr;vector<char> buf;size_t at=0;
+ explicit FastOut(const string& path):buf(1<<20){f=fopen(path.c_str(),"wb");if(!f){perror("fopen");exit(2);}}
+ ~FastOut(){flush();if(f)fclose(f);}
+ void flush(){if(at){fwrite(buf.data(),1,at,f);at=0;}}
+ void raw(const char* p,size_t n){if(n>buf.size()){flush();fwrite(p,1,n,f);return;}if(at+n>buf.size())flush();memcpy(buf.data()+at,p,n);at+=n;}
+ void str(SV v){raw(v.data(),v.size());}
+ void ch(char c){if(at==buf.size())flush();buf[at++]=c;}
+ template<class T> void num(T v){char x[32];auto r=to_chars(x,x+sizeof(x),v);raw(x,(size_t)(r.ptr-x));}
+ void field(SV v){if(v.find('\r')==SV::npos){str(v);return;}ch('"');str(v);ch('"');}
+ void date(int32_t z){
+  z+=719468;int era=(z>=0?z:z-146096)/146097;unsigned doe=(unsigned)(z-era*146097);
+  unsigned yoe=(doe-doe/1460+doe/36524-doe/146096)/365;int y=(int)yoe+era*400;
+  unsigned doy=doe-(365*yoe+yoe/4-yoe/100);unsigned mp=(5*doy+2)/153;
+  unsigned d=doy-(153*mp+2)/5+1,m=mp+(mp<10?3:-9);y+=(m<=2);
+  char x[10];x[0]='0'+(y/1000)%10;x[1]='0'+(y/100)%10;x[2]='0'+(y/10)%10;x[3]='0'+y%10;x[4]='-';
+  x[5]='0'+m/10;x[6]='0'+m%10;x[7]='-';x[8]='0'+d/10;x[9]='0'+d%10;raw(x,10);
+ }
+};
 template<class T,class Key>
 static void radix64(vector<T>& a, Key key, int passes=4){
  if(a.size()<2)return;
@@ -722,15 +735,18 @@ int main(){
  // Write unquoted TSV-style output with no field containing tabs/newlines per the input dialect.
  // Input values cannot contain commas, so a strict CSV output is sufficient.
  {
-  ofstream f(out+"/user_daily.csv",ios::binary);f<<"user_id,day,sessions,events,revenue_cents,top_category\n";
-  for(const UserDay&u:ud){write_field(f,people[u.person]);f<<','<<date_string(u.day)<<','<<u.sessions<<','<<u.events<<','<<u.revenue<<',';
-   if(u.top_category!=UINT16_MAX)write_field(f,categories[u.top_category]);f<<'\n';}
+  FastOut f(out+"/user_daily.csv");f.str("user_id,day,sessions,events,revenue_cents,top_category\n");
+  for(const UserDay&u:ud){
+   f.field(people[u.person]);f.ch(',');f.date(u.day);f.ch(',');f.num(u.sessions);f.ch(',');f.num(u.events);f.ch(',');f.num(u.revenue);f.ch(',');
+   if(u.top_category!=UINT16_MAX)f.field(categories[u.top_category]);f.ch('\n');
+  }
  }
  {
-  ofstream f(out+"/campaign_daily.csv",ios::binary);f<<"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
+  FastOut f(out+"/campaign_daily.csv");f.str("campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n");
   for(size_t id=0;id<campaigns.size();id++)for(int d=0;d<nday;d++){
    auto &v=camp[id*nday+d];if(v.sessions==0&&v.assists==0)continue;
-   write_field(f,campaigns[id]);f<<',';write_field(f,channels[id]);f<<','<<date_string(d+day_base)<<','<<v.sessions<<','<<v.purchasing<<','<<v.revenue<<','<<v.assists<<'\n';
+   f.field(campaigns[id]);f.ch(',');f.field(channels[id]);f.ch(',');f.date(d+day_base);f.ch(',');
+   f.num(v.sessions);f.ch(',');f.num(v.purchasing);f.ch(',');f.num(v.revenue);f.ch(',');f.num(v.assists);f.ch('\n');
   }
  }
  lap("csv_output");
