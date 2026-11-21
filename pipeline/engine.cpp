@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <duckdb.h>
 #ifdef _OPENMP
 #include <parallel/algorithm>
 #include <omp.h>
@@ -106,23 +107,15 @@ struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
 static vector<fs::path> input_files(const string& dir){vector<fs::path> files; if(!fs::exists(dir))return files;for(auto&e:fs::directory_iterator(dir))if(e.is_regular_file()&&e.path().extension()==".csv")files.push_back(e.path());sort(files.begin(),files.end());return files;}
 static bool split_csv(SV s,int n,SV *out){
  if(s.empty())return false;
- // Common generator path: unquoted CSV with a fixed field count.
- // Scan once, recording commas while simultaneously detecting quotes.
- {
-  const char* b=s.data();const char* e=b+s.size();const char* start=b;int k=0;bool quoted=false;
-  for(const char* p=b;p<e;p++){
-   unsigned char c=(unsigned char)*p;
-   if(c=='"'){quoted=true;break;}
-   if(c==','){
-    if(k>=n-1)return false;
-    out[k++]=SV(start,(size_t)(p-start));start=p+1;
-   }
+ if(memchr(s.data(),'"',s.size())==nullptr){
+  size_t from=0;
+  for(int k=0;k<n;k++){
+   size_t pos=s.find(',',from);
+   if(k==n-1){if(pos!=SV::npos)return false;pos=s.size();}
+   else if(pos==SV::npos)return false;
+   out[k]=s.substr(from,pos-from);from=pos+1;
   }
-  if(!quoted){
-   if(k!=n-1)return false;
-   out[k]=SV(start,(size_t)(e-start));
-   return true;
-  }
+  return true;
  }
  size_t from=0;for(int k=0;k<n;k++){
   size_t pos=s.find(',',from);
@@ -890,6 +883,25 @@ int main(){
   }
  }
  lap("csv_output");
+ // Final Parquet emission in-process: avoids spawning a second DuckDB process.
+ duckdb_database db=nullptr;duckdb_connection con=nullptr;duckdb_result qr;
+ if(duckdb_open(nullptr,&db)!=DuckDBSuccess)fail("duckdb_open failed");
+ if(duckdb_connect(db,&con)!=DuckDBSuccess){duckdb_close(&db);fail("duckdb_connect failed");}
+ auto dq=[&](const string& sql){
+  if(duckdb_query(con,sql.c_str(),&qr)!=DuckDBSuccess){
+   string msg=duckdb_result_error(&qr)?duckdb_result_error(&qr):"duckdb query failed";
+   duckdb_destroy_result(&qr);fail(msg);
+  }
+  duckdb_destroy_result(&qr);
+ };
+ fs::create_directories(out+"/user_daily");fs::create_directories(out+"/campaign_daily");
+ string escout=out;size_t ep=0;while((ep=escout.find(''',ep))!=string::npos){escout.insert(ep,"'");ep+=2;}
+ dq("SET threads="+to_string(max(1,ncpu)));
+ dq("COPY (SELECT * FROM read_csv('"+escout+"/user_daily.csv', columns={'user_id':'VARCHAR','day':'DATE','sessions':'BIGINT','events':'BIGINT','revenue_cents':'BIGINT','top_category':'VARCHAR'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+escout+"/user_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
+ dq("COPY (SELECT * FROM read_csv('"+escout+"/campaign_daily.csv', columns={'campaign_id':'VARCHAR','channel':'VARCHAR','day':'DATE','sessions':'BIGINT','purchasing_sessions':'BIGINT','revenue_cents':'BIGINT','assisted_sessions':'BIGINT'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+escout+"/campaign_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
+ duckdb_disconnect(&con);duckdb_close(&db);
+ fs::remove(out+"/user_daily.csv");fs::remove(out+"/campaign_daily.csv");
+ lap("parquet_output");
  cerr<<"engine time="<<chrono::duration<double>(chrono::steady_clock::now()-t0).count()<<"s\n";
  return 0;
 }
