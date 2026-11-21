@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <emmintrin.h>
 #ifdef _OPENMP
 #include <parallel/algorithm>
 #include <omp.h>
@@ -106,15 +107,34 @@ struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
 static vector<fs::path> input_files(const string& dir){vector<fs::path> files; if(!fs::exists(dir))return files;for(auto&e:fs::directory_iterator(dir))if(e.is_regular_file()&&e.path().extension()==".csv")files.push_back(e.path());sort(files.begin(),files.end());return files;}
 static bool split_csv(SV s,int n,SV *out){
  if(s.empty())return false;
- if(memchr(s.data(),'"',s.size())==nullptr){
-  size_t from=0;
-  for(int k=0;k<n;k++){
-   size_t pos=s.find(',',from);
-   if(k==n-1){if(pos!=SV::npos)return false;pos=s.size();}
-   else if(pos==SV::npos)return false;
-   out[k]=s.substr(from,pos-from);from=pos+1;
+ // SSE2 is baseline for x86-64. Scan commas and quotes together in one inline pass.
+ {
+  const char* b=s.data();size_t len=s.size(),start=0,pos=0;int k=0;bool quoted=false;
+  const __m128i comma=_mm_set1_epi8(','), quote=_mm_set1_epi8('"');
+  for(;pos+16<=len;pos+=16){
+   __m128i v=_mm_loadu_si128((const __m128i*)(b+pos));
+   unsigned qm=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v,quote));
+   if(qm){quoted=true;break;}
+   unsigned cm=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v,comma));
+   while(cm){
+    unsigned bit=(unsigned)__builtin_ctz(cm);size_t at=pos+bit;
+    if(k>=n-1)return false;
+    out[k++]=SV(b+start,at-start);start=at+1;cm&=cm-1;
+   }
   }
-  return true;
+  if(!quoted){
+   for(;pos<len;pos++){
+    char c=b[pos];if(c=='"'){quoted=true;break;}
+    if(c==','){
+     if(k>=n-1)return false;
+     out[k++]=SV(b+start,pos-start);start=pos+1;
+    }
+   }
+   if(!quoted){
+    if(k!=n-1)return false;
+    out[k]=SV(b+start,len-start);return true;
+   }
+  }
  }
  size_t from=0;for(int k=0;k<n;k++){
   size_t pos=s.find(',',from);
