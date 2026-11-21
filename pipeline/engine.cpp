@@ -116,10 +116,10 @@ template<class F>static void foreach_csv(const Mapping&m,int n,F action){
   p=(q==end)?end:q+1;
  }
 }
-struct Node{int parent,weight;string value;};
+struct Node{int parent,weight;SV value;};
 struct UnionFind{
- vector<Node> nodes;unordered_map<string,int,Hash,Eq> index;
- int add(SV s){auto it=index.find(s);if(it!=index.end())return it->second;int id=nodes.size();nodes.push_back({id,1,string(s)});index.emplace(nodes.back().value,id);return id;}
+ vector<Node> nodes;unordered_map<SV,int,Hash,Eq> index;
+ int add(SV s){auto it=index.find(s);if(it!=index.end())return it->second;int id=nodes.size();nodes.push_back({id,1,s});index.emplace(s,id);return id;}
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
@@ -382,7 +382,7 @@ int main(){
  }
  uint16_t organic=campaigns.size();campaigns.push_back("organic");channels.push_back("organic");
  UnionFind dsu;
- for(auto&p:input_files(data+"/links")){Mapping m(p);foreach_csv(m,2,[&](SV*f){if(!f[0].empty()&&!f[1].empty())dsu.join(f[0],f[1]);});}
+ for(auto&p:input_files(data+"/links")){maps.emplace_back(p);foreach_csv(maps.back(),2,[&](SV*f){if(!f[0].empty()&&!f[1].empty())dsu.join(f[0],f[1]);});}
  vector<int32_t> rootperson(dsu.nodes.size(),-1);
  vector<SV> min_name(dsu.nodes.size());
  for(int i=0;i<(int)dsu.nodes.size();i++){int r=dsu.root(i);SV nm=dsu.nodes[i].value;if(min_name[r].empty()||byte_less(nm,min_name[r]))min_name[r]=nm;}
