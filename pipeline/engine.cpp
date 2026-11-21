@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "native_parquet.hpp"
 #ifdef _OPENMP
 #include <parallel/algorithm>
 #include <omp.h>
@@ -864,24 +865,45 @@ int main(){
  vector<Click>().swap(clicks);
  lap("assist_count");
  fs::create_directories(out);
- // Write unquoted TSV-style output with no field containing tabs/newlines per the input dialect.
- // Input values cannot contain commas, so a strict CSV output is sufficient.
- {
-  FastOut f(out+"/user_daily.csv");f.str("user_id,day,sessions,events,revenue_cents,top_category\n");
-  for(const UserDay&u:ud){
-   f.field(people[u.person]);f.ch(',');f.date(u.day);f.ch(',');f.num(u.sessions);f.ch(',');f.num(u.events);f.ch(',');f.num(u.revenue);f.ch(',');
-   if(u.top_category!=UINT16_MAX)f.field(categories[u.top_category]);f.ch('\n');
+ fs::create_directories(out+"/user_daily");
+ fs::create_directories(out+"/campaign_daily");
+
+ struct CampRow{uint16_t id;int32_t day;};
+ vector<CampRow> camp_rows;camp_rows.reserve(campaigns.size()*min(nday,16));
+ for(size_t id=0;id<campaigns.size();id++)for(int d=0;d<nday;d++){
+  auto &v=camp[id*nday+d];if(v.sessions||v.assists)camp_rows.push_back({(uint16_t)id,d+day_base});
+ }
+
+ size_t user_parts=1;
+ if(!ud.empty())user_parts=min<size_t>(max(1,ncpu),max<size_t>(1,(ud.size()+199999)/200000));
+ size_t tasks=user_parts+1;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t task=0;task<tasks;task++){
+  if(task<user_parts){
+   size_t first=ud.size()*task/user_parts,last=ud.size()*(task+1)/user_parts;
+   string path=out+"/user_daily/part-"+to_string(task)+".parquet";
+   nativepq::write_users(path,first,last,
+    [&](size_t i)->SV{return people[ud[i].person];},
+    [&](size_t i)->int32_t{return ud[i].day;},
+    [&](size_t i)->int64_t{return ud[i].sessions;},
+    [&](size_t i)->int64_t{return ud[i].events;},
+    [&](size_t i)->int64_t{return ud[i].revenue;},
+    [&](size_t i)->bool{return ud[i].top_category!=UINT16_MAX;},
+    [&](size_t i)->SV{return categories[ud[i].top_category];});
+  }else{
+   nativepq::write_campaigns(out+"/campaign_daily/part-0.parquet",camp_rows.size(),
+    [&](size_t i)->SV{return campaigns[camp_rows[i].id];},
+    [&](size_t i)->SV{return channels[camp_rows[i].id];},
+    [&](size_t i)->int32_t{return camp_rows[i].day;},
+    [&](size_t i)->int64_t{auto&r=camp[(size_t)camp_rows[i].id*nday+camp_rows[i].day-day_base];return r.sessions;},
+    [&](size_t i)->int64_t{auto&r=camp[(size_t)camp_rows[i].id*nday+camp_rows[i].day-day_base];return r.purchasing;},
+    [&](size_t i)->int64_t{auto&r=camp[(size_t)camp_rows[i].id*nday+camp_rows[i].day-day_base];return r.revenue;},
+    [&](size_t i)->int64_t{auto&r=camp[(size_t)camp_rows[i].id*nday+camp_rows[i].day-day_base];return r.assists;});
   }
  }
- {
-  FastOut f(out+"/campaign_daily.csv");f.str("campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n");
-  for(size_t id=0;id<campaigns.size();id++)for(int d=0;d<nday;d++){
-   auto &v=camp[id*nday+d];if(v.sessions==0&&v.assists==0)continue;
-   f.field(campaigns[id]);f.ch(',');f.field(channels[id]);f.ch(',');f.date(d+day_base);f.ch(',');
-   f.num(v.sessions);f.ch(',');f.num(v.purchasing);f.ch(',');f.num(v.revenue);f.ch(',');f.num(v.assists);f.ch('\n');
-  }
- }
- lap("csv_output");
+ lap("parquet_output");
  cerr<<"engine time="<<chrono::duration<double>(chrono::steady_clock::now()-t0).count()<<"s\n";
  return 0;
 }
