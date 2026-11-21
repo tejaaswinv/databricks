@@ -13,7 +13,6 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <emmintrin.h>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -97,32 +96,14 @@ struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
 static vector<fs::path> input_files(const string& dir){vector<fs::path> files; if(!fs::exists(dir))return files;for(auto&e:fs::directory_iterator(dir))if(e.is_regular_file()&&e.path().extension()==".csv")files.push_back(e.path());sort(files.begin(),files.end());return files;}
 static bool split_csv(SV s,int n,SV *out){
  if(s.empty())return false;
- const char* p=s.data();size_t len=s.size();
- uint16_t commas[7],quotes[16];int nc=0,nq=0;
- const __m128i cv=_mm_set1_epi8(','),qv=_mm_set1_epi8('"');
- size_t i=0;
- for(;i+16<=len;i+=16){
-  __m128i v=_mm_loadu_si128((const __m128i*)(p+i));
-  unsigned cm=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v,cv));
-  unsigned qm=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v,qv));
-  while(cm){unsigned b=__builtin_ctz(cm);if(nc>=n)return false;commas[nc++]=(uint16_t)(i+b);cm&=cm-1;}
-  while(qm){unsigned b=__builtin_ctz(qm);if(nq>=2*n)return false;quotes[nq++]=(uint16_t)(i+b);qm&=qm-1;}
- }
- for(;i<len;i++){
-  if(p[i]==','){if(nc>=n)return false;commas[nc++]=(uint16_t)i;}
-  else if(p[i]=='"'){if(nq>=2*n)return false;quotes[nq++]=(uint16_t)i;}
- }
- if(nc!=n-1)return false;
- size_t start=0;int qi=0;
- for(int k=0;k<n;k++){
-  size_t stop=(k==n-1)?len:(size_t)commas[k];
-  while(qi<nq&&quotes[qi]<start)qi++;
-  int q0=qi;while(qi<nq&&quotes[qi]<stop)qi++;
-  int qcount=qi-q0;
-  if(qcount==0)out[k]=SV(p+start,stop-start);
-  else if(qcount==2&&quotes[q0]==start&&quotes[q0+1]+1==stop)out[k]=SV(p+start+1,stop-start-2);
-  else return false;
-  start=stop+1;
+ size_t from=0;for(int k=0;k<n;k++){
+  size_t pos=s.find(',',from);
+  if(k==n-1){if(pos!=SV::npos)return false;pos=s.size();}
+  else if(pos==SV::npos)return false;
+  SV v=s.substr(from,pos-from);
+  if(!v.empty()&&v.front()=='"'){if(v.size()<2||v.back()!='"')return false;v.remove_prefix(1);v.remove_suffix(1);}
+  if(v.find('"')!=SV::npos)return false;
+  out[k]=v;from=pos+1;
  }
  return true;
 }
@@ -138,8 +119,18 @@ template<class F>static void foreach_csv(const Mapping&m,int n,F action){
 }
 struct Node{int parent,weight;SV value;};
 struct UnionFind{
- vector<Node> nodes;unordered_map<SV,int,Hash,Eq> index;
- int add(SV s){auto it=index.find(s);if(it!=index.end())return it->second;int id=nodes.size();nodes.push_back({id,1,s});index.emplace(s,id);return id;}
+ vector<Node> nodes;vector<uint32_t> buckets;size_t used=0;
+ UnionFind(){buckets.assign(1024,0);}
+ void grow(){
+  vector<uint32_t> nb(buckets.size()*2,0);size_t mask=nb.size()-1;
+  for(uint32_t v:buckets)if(v){size_t p=Hash{}(nodes[v-1].value)&mask;while(nb[p])p=(p+1)&mask;nb[p]=v;}
+  buckets.swap(nb);
+ }
+ int add(SV s){
+  if(used*10>=buckets.size()*7)grow();size_t p=Hash{}(s)&(buckets.size()-1);
+  while(buckets[p]){uint32_t v=buckets[p];if(nodes[v-1].value==s)return (int)v-1;p=(p+1)&(buckets.size()-1);}
+  int id=(int)nodes.size();nodes.push_back({id,1,s});buckets[p]=(uint32_t)id+1;used++;return id;
+ }
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
@@ -447,7 +438,7 @@ int main(){
   if(canonical_base36_id(dsu.nodes[i].value,'u',uk))numeric_people.add(uk,link_person[i]);
   else person_map.add_link(dsu.nodes[i].value,link_person[i]);
  }
- dsu.index.clear();dsu.index.rehash(0);
+ dsu.buckets.clear();dsu.buckets.shrink_to_fit();
  auto person_find=[&](SV name)->uint32_t{
   uint64_t uk;if(canonical_base36_id(name,'u',uk))return numeric_people.find(uk);
   return person_map.find_only(name);
