@@ -105,6 +105,7 @@ struct UnionFind{
 struct Cand{SV eventid, user, ts, prod; int64_t ingest; int32_t price; uint32_t meta;}; // meta: low 8 type, high 24 cached hash
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
+struct ClickCand{SV clickid,user;uint32_t t;uint32_t person;uint32_t h24;uint16_t campaign;uint16_t unused=0;};
 struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
@@ -205,6 +206,22 @@ struct FlatClickSet {
  bool insert(SV k){if(used*10>=buckets.size()*7)grow();size_t p=hash<SV>{}(k)&(buckets.size()-1);
   while(buckets[p]){if(rows[buckets[p]-1].clickid==k)return false;p=(p+1)&(buckets.size()-1);}
   buckets[p]=(uint32_t)rows.size()+1;used++;return true;
+ }
+};
+struct FlatClickCandIndex {
+ vector<uint32_t> buckets;
+ vector<ClickCand>& rows;
+ explicit FlatClickCandIndex(vector<ClickCand>& r,size_t expected):rows(r){
+  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);
+ }
+ bool insert(const ClickCand& c){
+  size_t p=c.h24&(buckets.size()-1);
+  while(buckets[p]){
+   if(rows[buckets[p]-1].clickid==c.clickid)return false;
+   p=(p+1)&(buckets.size()-1);
+  }
+  buckets[p]=(uint32_t)rows.size()+1;
+  return true;
  }
 };
 static int64_t parse_ingest(SV s){
@@ -488,20 +505,75 @@ int main(){
  vector<vector<Evt>>().swap(resolved_pending);
  vector<vector<PendingEvt>>().swap(pending_by_part);
  cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<pending_n<<"\n";lap("event_validate");
- // Clicks: identical duplicates can safely be deduped after validation.
- vector<Click> clicks;clicks.reserve(max<size_t>(1000,events.size()/4));
- FlatClickSet click_seen(clicks,max<size_t>(1000,events.size()/4));
- for(auto&p:input_files(data+"/clicks")){
-  maps.emplace_back(p);
-  foreach_csv(maps.back(),4,[&](SV*f){
-   if(f[0].empty()||f[1].empty())return;
-   auto it=campaign_ids.find(f[2]);if(it==campaign_ids.end())return;
-   int64_t ts;if(!parse_time(f[3],ts)||ts<ws-WEEK||ts>=we)return;
-   if(!click_seen.insert(f[0]))return;
-   clicks.push_back({f[0],(uint32_t)(ts-(ws-WEEK)),person_for(f[1]),it->second,0});
-  });
+ // Clicks: parse + validate in parallel, then exact-dedup independent ID shards.
+ auto click_paths=input_files(data+"/clicks");
+ vector<Work> click_chunks;
+ for(auto&p:click_paths){
+  maps.emplace_back(p);const auto&m=maps.back();
+  if(!m.n)continue;
+  const char* end=m.p+m.n;
+  const char* header=(const char*)memchr(m.p,'\n',m.n);if(!header)continue;
+  const char* first=header+1;if(first==end)continue;
+  size_t span=end-first;
+  size_t np=max<size_t>(1,min<size_t>(64,(span+262143)/262144));
+  vector<const char*> bounds(np+1);bounds[0]=first;bounds[np]=end;
+  for(size_t j=1;j<np;j++){const char* p=first+span*j/np;const char* q=(const char*)memchr(p,'\n',end-p);bounds[j]=q?q+1:end;}
+  for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])click_chunks.push_back({bounds[j],bounds[j+1]});
  }
- click_seen.buckets.clear();click_seen.buckets.shrink_to_fit();
+ constexpr size_t CPARTS=16;
+ size_t click_est=max<size_t>(1000,events.size()/4);
+ vector<vector<ClickCand>> click_raw(workers*CPARTS);
+ for(auto&v:click_raw)v.reserve(click_est/workers/CPARTS+16);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+ for(size_t ch=0;ch<click_chunks.size();ch++){
+  size_t tid=0;
+#ifdef _OPENMP
+  tid=(size_t)omp_get_thread_num();
+#endif
+  const char* p=click_chunks[ch].begin;const char* end=click_chunks[ch].end;SV f[4];
+  while(p<end){
+   const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
+   if(split_csv(SV(p,q-p),4,f)&&!f[0].empty()&&!f[1].empty()){
+    auto ci=campaign_ids.find(f[2]);
+    if(ci!=campaign_ids.end()){
+     int64_t ts;
+     if(parse_time(f[3],ts)&&ts>=ws-WEEK&&ts<we){
+      size_t h=hash<SV>{}(f[0]);uint32_t hp=(uint32_t)h&0x00ffffffu;
+      uint32_t person=person_map.find_only(f[1]);
+      click_raw[tid*CPARTS+(h%CPARTS)].push_back({f[0],f[1],(uint32_t)(ts-(ws-WEEK)),person,hp,ci->second,0});
+     }
+    }
+   }
+   p=(q==end)?end:q+1;
+  }
+ }
+ vector<vector<ClickCand>> click_unique(CPARTS);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t part=0;part<CPARTS;part++){
+  size_t n=0;for(size_t t=0;t<workers;t++)n+=click_raw[t*CPARTS+part].size();
+  vector<ClickCand> rows;rows.reserve(n);FlatClickCandIndex idx(rows,n);
+  for(size_t t=0;t<workers;t++){
+   auto& src=click_raw[t*CPARTS+part];
+   for(const ClickCand& c:src)if(idx.insert(c))rows.push_back(c);
+   vector<ClickCand>().swap(src);
+  }
+  click_unique[part]=move(rows);
+ }
+ vector<vector<ClickCand>>().swap(click_raw);
+ size_t click_n=0;for(auto&v:click_unique)click_n+=v.size();
+ vector<Click> clicks;clicks.reserve(click_n);
+ for(auto&v:click_unique){
+  for(const ClickCand& c:v){
+   uint32_t p=c.person==UINT32_MAX?person_for(c.user):c.person;
+   clicks.push_back({c.clickid,c.t,p,c.campaign,0});
+  }
+  vector<ClickCand>().swap(v);
+ }
+ vector<vector<ClickCand>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
  // Sessions from globally sorted valid events, across every linked ID.
  order_events(events);lap("event_sort");
