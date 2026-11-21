@@ -40,7 +40,7 @@ jobs:
       - name: A/B benchmark current vs previous optimized commit
         run: |
           generator/target/release/generate --seed 7 --events 5000000 --clicks 1250000 --output bench
-          git worktree add --detach /tmp/baseline 95f4ee1e718e5a7a837fa1fcf5d926a5c43f8d8c
+          git worktree add --detach /tmp/baseline a75a82b160c0fea67cbb3852978ad6c0dbfa8604
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
 
           # Warm both images so timing is not dominated by first-read filesystem cache.
