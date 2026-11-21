@@ -14,6 +14,5 @@ COPY --from=builder /app/engine /app/engine
 COPY --from=builder /app/duckdb /app/duckdb
 COPY run.sh /app/run.sh
 RUN chmod 755 /app/engine /app/duckdb /app/run.sh
-ENV OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=1000000
 WORKDIR /app
 CMD ["/app/run.sh"]
