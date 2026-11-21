@@ -25,6 +25,14 @@ jobs:
           cargo --version
           cargo build --release --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+      - name: Inspect public generator hot-path shapes
+        run: |
+          echo '=== generated event sample ==='
+          f=$(find dev/events -name '*.csv' | head -1); head -6 "$f"
+          echo '=== generated click sample ==='
+          f=$(find dev/clicks -name '*.csv' | head -1); head -6 "$f"
+          echo '=== generator source hints ==='
+          grep -R -n -E 'event_id|click_id|ingest_ts|base36|timestamp|duplicate' generator/src | head -100 || true
       - name: Build submission image
         run: docker build --platform linux/amd64 -t shopping-sessions:latest .
       - name: Install official checker dependency
