@@ -102,7 +102,7 @@ struct UnionFind{
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
-struct Cand{SV eventid, user, ts, prod; int64_t ingest; int32_t price; uint32_t meta;}; // meta: low 8 type, high 24 cached hash
+struct Cand{SV line,eventid;int64_t ingest;uint32_t h24;uint32_t unused=0;};
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct ClickCand{SV clickid,user;uint32_t t;uint32_t person;uint32_t h24;uint16_t campaign;uint16_t unused=0;};
@@ -171,7 +171,7 @@ struct FlatEventIndex {
  uint32_t get_or_create(const Cand& c) {
    if(used*10>=buckets.size()*7)grow();
    size_t mask=buckets.size()-1;
-   size_t p=(c.meta>>8)&mask;
+   size_t p=c.h24&mask;
    for(;;) {
      uint32_t v=buckets[p];
      if(!v) {
@@ -187,7 +187,7 @@ struct FlatEventIndex {
    vector<uint32_t> nb(buckets.size()*2,0);
    size_t mask=nb.size()-1;
    for(uint32_t v:buckets) if(v) {
-     size_t p=(rows[v-1].meta>>8)&mask;
+     size_t p=rows[v-1].h24&mask;
      while(nb[p])p=(p+1)&mask;
      nb[p]=v;
    }
@@ -397,11 +397,10 @@ int main(){
   SV f[7];
   while(p<end){
    const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
-   if(split_csv(SV(p,q-p),7,f)&&!f[0].empty()){
+   SV line(p,q-p);
+   if(split_csv(line,7,f)&&!f[0].empty()){
      size_t h=hash<SV>{}(f[0]);
-     uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-     uint32_t meta=((uint32_t(h)&0x00ffffffu)<<8)|tp;
-     raw[tid*PARTS+(h%PARTS)].push_back({f[0],f[1],f[2],f[5],parse_ingest(f[3]),(tp==2?parse_price(f[6]):0),meta});
+     raw[tid*PARTS+(h%PARTS)].push_back({line,f[0],parse_ingest(f[3]),(uint32_t)h&0x00ffffffu,0});
    }
    p=(q==end)?end:q+1;
   }
@@ -440,18 +439,21 @@ int main(){
   auto& pending=pending_by_part[part];
   good.reserve(rows.size());
   pending.reserve(rows.size()/3+16);
+  SV f[7];
   for(const Cand& c:rows){
-   if(c.user.empty()||c.prod.empty()||(uint8_t)(c.meta&0xff)==3)continue;
-   int64_t ts;if(!parse_time(c.ts,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
+   if(!split_csv(c.line,7,f))continue; // parsed once already; retained for exact winner reparse
+   uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
+   if(f[1].empty()||f[5].empty()||tp==3)continue;
+   int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
    int32_t price=0;uint16_t cat=unknown;
-   if((uint8_t)(c.meta&0xff)==2){
-    if(c.price<=0)continue;
-    price=c.price;auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
+   if(tp==2){
+    price=parse_price(f[6]);if(price<=0)continue;
+    auto it=products.find(f[5]);if(it!=products.end())cat=it->second;
    }
-   uint32_t p=person_map.find_only(c.user);
+   uint32_t p=person_map.find_only(f[1]);
    uint32_t t=(uint32_t)(ts-ws);
-   if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)((uint8_t)(c.meta&0xff)==2),0});
-   else pending.push_back({c.user,t,price,cat,(uint8_t)((uint8_t)(c.meta&0xff)==2),0});
+   if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
+   else pending.push_back({f[1],t,price,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
  }
