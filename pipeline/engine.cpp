@@ -35,6 +35,19 @@ struct Hash { using is_transparent=void; size_t operator()(SV s) const { return 
 struct Eq {using is_transparent=void; bool operator()(SV a,SV b) const {return a==b;} };
 static bool byte_less(SV a,SV b) {return lexicographical_compare(a.begin(),a.end(),b.begin(),b.end(),[](char x,char y){return (unsigned char)x<(unsigned char)y;});}
 static bool digits(SV v) {if(v.empty())return false; for(unsigned char ch:v)if(ch<'0'||ch>'9')return false;return true;}
+static bool user_key(SV s,uint64_t& out){
+ if(s.size()<2||s[0]!='u'||(s.size()>2&&s[1]=='0'))return false;
+ uint64_t v=0;
+ for(size_t i=1;i<s.size();i++){
+  unsigned char c=s[i];unsigned d;
+  if(c>='0'&&c<='9')d=c-'0';
+  else if(c>='a'&&c<='z')d=c-'a'+10;
+  else return false;
+  if(d>=36||v>((1ULL<<40)-1-d)/36)return false;
+  v=v*36+d;
+ }
+ out=v;return true;
+}
 static int64_t dnum(const char* p,int n) {int64_t x=0; for(int i=0;i<n;i++){if(p[i]<'0'||p[i]>'9')return -1; x=x*10+p[i]-'0';} return x;}
 static int64_t epoch_days(int y,int m,int d){ // Howard Hinnant: proleptic Gregorian
  y-=m<=2; int era=(y>=0 ? y:y-399)/400; unsigned yoe=(unsigned)(y-era*400); unsigned doy=(153*(m+(m>2?-3:9))+2)/5+d-1; unsigned yoe_days=yoe*365+yoe/4-yoe/100+doy; return int64_t(era)*146097+yoe_days-719468;
@@ -351,10 +364,28 @@ int main(){
  vector<SV> people;
  vector<uint32_t> link_person(dsu.nodes.size());
  for(int i=0;i<(int)dsu.nodes.size();i++){int r=dsu.root(i);if(rootperson[r]<0){rootperson[r]=people.size();people.push_back(min_name[r]);}link_person[i]=rootperson[r];}
- FastPeople person_map(people,dsu.nodes.size()+2000);
- for(size_t i=0;i<dsu.nodes.size();++i)person_map.add_link(dsu.nodes[i].value,link_person[i]);
+ FastPeople person_map(people,max<size_t>(2000,dsu.nodes.size()/32+256));
+ unordered_map<uint64_t,uint32_t> numeric_people;
+ numeric_people.reserve(dsu.nodes.size()+2000);
+ for(size_t i=0;i<dsu.nodes.size();++i){
+  uint64_t k;
+  if(user_key(dsu.nodes[i].value,k))numeric_people.emplace(k,link_person[i]);
+  else person_map.add_link(dsu.nodes[i].value,link_person[i]);
+ }
  dsu.index.clear();dsu.index.rehash(0);
- auto person_for=[&](SV name)->uint32_t{return person_map.get(name);};
+ auto person_find=[&](SV name)->uint32_t{
+  uint64_t k;
+  if(user_key(name,k)){auto it=numeric_people.find(k);return it==numeric_people.end()?UINT32_MAX:it->second;}
+  return person_map.find_only(name);
+ };
+ auto person_for=[&](SV name)->uint32_t{
+  uint64_t k;
+  if(user_key(name,k)){
+   auto it=numeric_people.find(k);if(it!=numeric_people.end())return it->second;
+   uint32_t id=(uint32_t)people.size();people.push_back(name);numeric_people.emplace(k,id);return id;
+  }
+  return person_map.get(name);
+ };
  cerr<<"links nodes="<<dsu.nodes.size()<<"\n";lap("links_dims");
  // Event dedup happens before *all* event validation.
  // Batch parse in parallel, then independently deduplicate by exact event ID.
@@ -458,7 +489,7 @@ int main(){
     price=parse_price(f[6]);if(price<=0)continue;
     auto it=products.find(f[5]);if(it!=products.end())cat=it->second;
    }
-   uint32_t p=person_map.find_only(f[1]);
+   uint32_t p=person_find(f[1]);
    uint32_t t=(uint32_t)(ts-ws);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({f[1],t,price,cat,(uint8_t)(tp==2),0});
@@ -474,12 +505,15 @@ int main(){
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
  // so assignment order is irrelevant; every equal byte string still gets exactly one person.
  constexpr size_t ID_SHARDS=256;
- array<unordered_map<SV,uint32_t,Hash,Eq>,ID_SHARDS> standalone;
+ array<unordered_map<uint64_t,uint32_t>,ID_SHARDS> standalone_num;
+ array<unordered_map<SV,uint32_t,Hash,Eq>,ID_SHARDS> standalone_str;
  array<mutex,ID_SHARDS> standalone_mu;
  size_t per_shard=max<size_t>(16,pending_n/24/ID_SHARDS+8);
- for(auto& m:standalone)m.reserve(per_shard);
+ for(auto& m:standalone_num)m.reserve(per_shard);
+ for(auto& m:standalone_str)m.reserve(8);
  uint32_t people_base=(uint32_t)people.size();
  people.resize((size_t)people_base+pending_n);
+ numeric_people.reserve(numeric_people.size()+pending_n/16+1024);
  atomic<uint32_t> next_person(people_base);
  vector<vector<Evt>> resolved_pending(PARTS);
 #ifdef _OPENMP
@@ -490,17 +524,20 @@ int main(){
   auto& dst=resolved_pending[part];
   dst.reserve(src.size());
   for(const PendingEvt& e:src){
-   size_t h=Hash{}(e.user), sh=h&(ID_SHARDS-1);
+   uint64_t k;bool numeric=user_key(e.user,k);
+   size_t sh=(numeric?(size_t)k:Hash{}(e.user))&(ID_SHARDS-1);
    uint32_t p;
    {
     lock_guard<mutex> lock(standalone_mu[sh]);
-    auto& m=standalone[sh];
-    auto it=m.find(e.user);
-    if(it==m.end()){
-     p=next_person.fetch_add(1,memory_order_relaxed);
-     m.emplace(e.user,p);
-     people[p]=e.user;
-    }else p=it->second;
+    if(numeric){
+     auto& m=standalone_num[sh];auto it=m.find(k);
+     if(it==m.end()){p=next_person.fetch_add(1,memory_order_relaxed);m.emplace(k,p);people[p]=e.user;}
+     else p=it->second;
+    }else{
+     auto& m=standalone_str[sh];auto it=m.find(e.user);
+     if(it==m.end()){p=next_person.fetch_add(1,memory_order_relaxed);m.emplace(e.user,p);people[p]=e.user;}
+     else p=it->second;
+    }
    }
    dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
   }
@@ -508,9 +545,10 @@ int main(){
  }
  uint32_t final_people=next_person.load(memory_order_relaxed);
  people.resize(final_people);
- // Make the newly assigned IDs available to click processing. This is once per unique
- // ID rather than once per event.
- for(uint32_t p=people_base;p<final_people;p++)person_map.add_link(people[p],p);
+ // Register each newly discovered standalone ID once for click processing.
+ for(uint32_t p=people_base;p<final_people;p++){
+  uint64_t k;if(user_key(people[p],k))numeric_people.emplace(k,p);else person_map.add_link(people[p],p);
+ }
  for(auto& v:resolved_pending){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(resolved_pending);
  vector<vector<PendingEvt>>().swap(pending_by_part);
@@ -551,7 +589,7 @@ int main(){
      int64_t ts;
      if(parse_time(f[3],ts)&&ts>=ws-WEEK&&ts<we){
       size_t h=Hash{}(f[0]);uint32_t hp=(uint32_t)h&0x00ffffffu;
-      uint32_t person=person_map.find_only(f[1]);
+      uint32_t person=person_find(f[1]);
       click_raw[tid*CPARTS+(h%CPARTS)].push_back({f[0],f[1],(uint32_t)(ts-(ws-WEEK)),person,hp,ci->second,0});
      }
     }
