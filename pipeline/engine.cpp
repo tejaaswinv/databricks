@@ -100,7 +100,7 @@ struct UnionFind{
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
-struct Cand{SV user, ts,prod, price; int64_t ingest; uint8_t type;};
+struct Cand{SV user, ts, prod; int64_t ingest; int32_t price; uint8_t type;};
 struct Evt{int64_t ts;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{int64_t ts;uint32_t person;uint16_t campaign;SV clickid;};
 struct Assist{uint32_t person;uint16_t campaign;int64_t ts;};
@@ -109,6 +109,12 @@ struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;ui
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
 struct CampDay{int64_t sessions=0,purchasing=0,revenue=0,assists=0;};
 static int64_t parse_ingest(SV s){int64_t x;return parse_time(s,x)?x:INT64_MAX;}
+static int32_t parse_price(SV s) {
+ if(!digits(s))return -1;
+ int32_t v=0;
+ for(char c:s){v=v*10+(c-'0');if(v>10000000)return -1;}
+ return v>0?v:-1;
+}
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
 static void write_field(ostream&os,SV s){
  // Values may contain a CR or quotes by spec? CSV field value cannot contain quotes or commas, CR is allowed.
@@ -183,8 +189,20 @@ int main(){
  // Event dedup happens before *all* event validation.
  unordered_map<SV,uint32_t,Hash,Eq> event_idx;
  vector<Cand> candidates;
- event_idx.reserve(2000000);candidates.reserve(2000000);
- for(auto&p:input_files(data+"/events")){
+ // Sample a few raw lines to avoid expensive vector reallocations and hash rehashes
+ // at 20-60 million events; no data content or generator shape is assumed.
+ auto event_paths=input_files(data+"/events");
+ uint64_t total_bytes=0, sample_bytes=0, sample_lines=0;
+ for(const auto&p:event_paths)total_bytes+=fs::file_size(p);
+ for(const auto&p:event_paths){
+  if(sample_lines>=5000)break;
+  ifstream f(p,ios::binary);string line;getline(f,line); // header
+  while(sample_lines<5000 && getline(f,line)){sample_bytes+=line.size()+1;sample_lines++;}
+ }
+ size_t event_capacity=2000000;
+ if(sample_lines&&sample_bytes){event_capacity=max<size_t>(1000, (long double)total_bytes*sample_lines/sample_bytes*1.05L);}
+ event_idx.reserve(event_capacity);candidates.reserve(event_capacity);
+ for(auto&p:event_paths){
   maps.emplace_back(p);
   foreach_csv(maps.back(),7,[&](SV*f){
     if(f[0].empty())return;
@@ -192,10 +210,10 @@ int main(){
     auto it=event_idx.find(f[0]);
     if(it==event_idx.end()){
       uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-      event_idx.emplace(f[0],candidates.size());candidates.push_back({f[1],f[2],f[5],f[6],ing,tp});
+      event_idx.emplace(f[0],candidates.size());candidates.push_back({f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp});
     } else if(ing<candidates[it->second].ingest){
       uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-      candidates[it->second]={f[1],f[2],f[5],f[6],ing,tp};
+      candidates[it->second]={f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp};
     }
   });
  }
@@ -206,9 +224,8 @@ int main(){
   int64_t ts;if(!parse_time(c.ts,ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
   int32_t price=0;uint16_t cat=unknown;
   if(c.type==2){
-   if(!digits(c.price))continue;
-   uint64_t p=0;for(char ch:c.price){p=p*10+(ch-'0');if(p>10000000)break;}if(p==0||p>10000000)continue;
-   price=p; auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
+   if(c.price<=0)continue;
+   price=c.price;auto it=products.find(c.prod);if(it!=products.end())cat=it->second;
   }
   events.push_back({ts,person_for(c.user),price,cat,(uint8_t)(c.type==2),0});
  }
