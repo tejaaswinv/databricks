@@ -196,7 +196,14 @@ struct FlatClickSet {
   buckets[p]=(uint32_t)rows.size()+1;used++;return true;
  }
 };
-static int64_t parse_ingest(SV s){int64_t x;return parse_time(s,x)?x:INT64_MAX;}
+static int64_t parse_ingest(SV s){
+ // rules.md guarantees ingest_ts is valid F1; avoid the generic validator on every raw event.
+ const char* p=s.data();
+ int y=(p[0]-'0')*1000+(p[1]-'0')*100+(p[2]-'0')*10+(p[3]-'0');
+ int mo=(p[5]-'0')*10+(p[6]-'0'), d=(p[8]-'0')*10+(p[9]-'0');
+ int h=(p[11]-'0')*10+(p[12]-'0'), mi=(p[14]-'0')*10+(p[15]-'0'), se=(p[17]-'0')*10+(p[18]-'0');
+ return (epoch_days(y,mo,d)*86400LL+h*3600+mi*60+se)*1000;
+}
 static int32_t parse_price(SV s) {
  if(!digits(s))return -1;
  int32_t v=0;
@@ -344,7 +351,7 @@ int main(){
   }
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])chunks.push_back({bounds[j],bounds[j+1]});
  }
- constexpr size_t PARTS=16;
+ constexpr size_t PARTS=64;
  const size_t workers=max(1,ncpu);
  vector<vector<Cand>> raw(workers*PARTS);
  for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
