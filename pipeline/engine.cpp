@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <emmintrin.h>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -96,14 +97,32 @@ struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
 static vector<fs::path> input_files(const string& dir){vector<fs::path> files; if(!fs::exists(dir))return files;for(auto&e:fs::directory_iterator(dir))if(e.is_regular_file()&&e.path().extension()==".csv")files.push_back(e.path());sort(files.begin(),files.end());return files;}
 static bool split_csv(SV s,int n,SV *out){
  if(s.empty())return false;
- size_t from=0;for(int k=0;k<n;k++){
-  size_t pos=s.find(',',from);
-  if(k==n-1){if(pos!=SV::npos)return false;pos=s.size();}
-  else if(pos==SV::npos)return false;
-  SV v=s.substr(from,pos-from);
-  if(!v.empty()&&v.front()=='"'){if(v.size()<2||v.back()!='"')return false;v.remove_prefix(1);v.remove_suffix(1);}
-  if(v.find('"')!=SV::npos)return false;
-  out[k]=v;from=pos+1;
+ const char* p=s.data();size_t len=s.size();
+ uint16_t commas[7],quotes[16];int nc=0,nq=0;
+ const __m128i cv=_mm_set1_epi8(','),qv=_mm_set1_epi8('"');
+ size_t i=0;
+ for(;i+16<=len;i+=16){
+  __m128i v=_mm_loadu_si128((const __m128i*)(p+i));
+  unsigned cm=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v,cv));
+  unsigned qm=(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v,qv));
+  while(cm){unsigned b=__builtin_ctz(cm);if(nc>=n)return false;commas[nc++]=(uint16_t)(i+b);cm&=cm-1;}
+  while(qm){unsigned b=__builtin_ctz(qm);if(nq>=2*n)return false;quotes[nq++]=(uint16_t)(i+b);qm&=qm-1;}
+ }
+ for(;i<len;i++){
+  if(p[i]==','){if(nc>=n)return false;commas[nc++]=(uint16_t)i;}
+  else if(p[i]=='"'){if(nq>=2*n)return false;quotes[nq++]=(uint16_t)i;}
+ }
+ if(nc!=n-1)return false;
+ size_t start=0;int qi=0;
+ for(int k=0;k<n;k++){
+  size_t stop=(k==n-1)?len:(size_t)commas[k];
+  while(qi<nq&&quotes[qi]<start)qi++;
+  int q0=qi;while(qi<nq&&quotes[qi]<stop)qi++;
+  int qcount=qi-q0;
+  if(qcount==0)out[k]=SV(p+start,stop-start);
+  else if(qcount==2&&quotes[q0]==start&&quotes[q0+1]+1==stop)out[k]=SV(p+start+1,stop-start-2);
+  else return false;
+  start=stop+1;
  }
  return true;
 }
