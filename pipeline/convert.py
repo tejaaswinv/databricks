@@ -1,27 +1,54 @@
 #!/usr/bin/env python3
-"""Convert compact C++ aggregate rows into exactly typed Parquet outputs."""
+"""Write the exact two final Parquet tables using DuckDB's typed CSV scanner."""
 import os
+import time
 from pathlib import Path
 import duckdb
 
+started = time.perf_counter()
 out = Path(os.environ.get("OUTPUT_DIR", "/output"))
-scratch = os.environ.get("SCRATCH_DIR", "/scratch")
+scratch = Path(os.environ.get("SCRATCH_DIR", "/scratch"))
 con = duckdb.connect()
-con.execute(f"SET threads = {int(os.getenv('NCPU','8'))}")
-con.execute(f"SET memory_limit = '{int(os.getenv('MEM_GB','24'))*8//10}GB'")
-con.execute(f"SET temp_directory = '{scratch}/duckdb_tmp'")
+con.execute(f"SET threads = {int(os.getenv('NCPU', '8'))}")
+con.execute(f"SET memory_limit = '{int(os.getenv('MEM_GB', '24')) * 8 // 10}GB'")
+con.execute(f"SET temp_directory = '{str(scratch / 'duckdb_tmp').replace(chr(39), chr(39)*2)}'")
 
-for tab, cols in {
-    "user_daily": "user_id::VARCHAR AS user_id, CAST(day AS DATE) AS day, CAST(sessions AS BIGINT) AS sessions, CAST(events AS BIGINT) AS events, CAST(revenue_cents AS BIGINT) AS revenue_cents, top_category::VARCHAR AS top_category",
-    "campaign_daily": "campaign_id::VARCHAR AS campaign_id, channel::VARCHAR AS channel, CAST(day AS DATE) AS day, CAST(sessions AS BIGINT) AS sessions, CAST(purchasing_sessions AS BIGINT) AS purchasing_sessions, CAST(revenue_cents AS BIGINT) AS revenue_cents, CAST(assisted_sessions AS BIGINT) AS assisted_sessions"
-}.items():
-    (out/tab).mkdir(parents=True, exist_ok=True)
-    path = str(out/f"{tab}.csv").replace("'", "''")
-    target = str(out/tab/"part-0.parquet").replace("'", "''")
-    names = ("user_id,day,sessions,events,revenue_cents,top_category" if tab == "user_daily"
-             else "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions")
-    schema = "{" + ",".join(f"'{x}':'VARCHAR'" for x in names.split(",")) + "}"
-    con.execute(f"COPY (SELECT {cols} FROM read_csv('{path}', columns={schema}, "
-                f"auto_detect=false, header=true, delim=',', "
-                f"new_line='\\n')) TO '{target}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-    (out/f"{tab}.csv").unlink()
+schemas = {
+    "user_daily": [
+        ("user_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("sessions", "BIGINT"),
+        ("events", "BIGINT"),
+        ("revenue_cents", "BIGINT"),
+        ("top_category", "VARCHAR"),
+    ],
+    "campaign_daily": [
+        ("campaign_id", "VARCHAR"),
+        ("channel", "VARCHAR"),
+        ("day", "DATE"),
+        ("sessions", "BIGINT"),
+        ("purchasing_sessions", "BIGINT"),
+        ("revenue_cents", "BIGINT"),
+        ("assisted_sessions", "BIGINT"),
+    ],
+}
+
+for table, columns in schemas.items():
+    directory = out / table
+    directory.mkdir(parents=True, exist_ok=True)
+    source = out / f"{table}.csv"
+    destination = directory / "part-0.parquet"
+    schema = "{" + ", ".join(f"'{name}':'{dtype}'" for name, dtype in columns) + "}"
+    src = str(source).replace("'", "''")
+    dst = str(destination).replace("'", "''")
+    # Typed CSV decoding avoids a second VARCHAR -> DATE/BIGINT conversion.
+    # Snappy is a fast, valid Parquet compression codec.
+    con.execute(
+        f"COPY (SELECT * FROM read_csv('{src}', columns={schema}, "
+        f"auto_detect=false, header=true, delim=',', new_line='\\n')) "
+        f"TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+    )
+    source.unlink()
+
+import sys
+print(f"parquet conversion time={time.perf_counter()-started:.6f}s", file=sys.stderr)
