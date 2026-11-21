@@ -31,19 +31,7 @@ using namespace std;
 namespace fs = std::filesystem;
 using SV = string_view;
 static constexpr int64_t DAY=86400000LL, WEEK=7*DAY, HOUR=3600000LL, GAP=1800000LL;
-static inline uint64_t hash_mix(uint64_t x){
- x^=x>>30;x*=0xbf58476d1ce4e5b9ULL;x^=x>>27;x*=0x94d049bb133111ebULL;x^=x>>31;return x;
-}
-struct Hash {
- using is_transparent=void;
- size_t operator()(SV s) const noexcept {
-  const char* p=s.data();size_t n=s.size();uint64_t a=0,b=0;
-  if(n<=8){if(n)memcpy(&a,p,n);return (size_t)hash_mix(a^(uint64_t(n)*0x9e3779b97f4a7c15ULL));}
-  memcpy(&a,p,8);memcpy(&b,p+n-8,8);
-  b=(b<<27)|(b>>(64-27));
-  return (size_t)hash_mix(a^b^(uint64_t(n)*0x9e3779b97f4a7c15ULL));
- }
-};
+struct Hash { using is_transparent=void; size_t operator()(SV s) const { return hash<SV>{}(s); } };
 struct Eq {using is_transparent=void; bool operator()(SV a,SV b) const {return a==b;} };
 static bool byte_less(SV a,SV b) {return lexicographical_compare(a.begin(),a.end(),b.begin(),b.end(),[](char x,char y){return (unsigned char)x<(unsigned char)y;});}
 static bool digits(SV v) {if(v.empty())return false; for(unsigned char ch:v)if(ch<'0'||ch>'9')return false;return true;}
