@@ -438,6 +438,7 @@ int main(){
  // are thread-safe. Only IDs absent from links are deferred for sequential insertion.
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
+ auto validate_t0=chrono::steady_clock::now();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
 #endif
@@ -466,6 +467,7 @@ int main(){
   vector<Cand>().swap(rows);
  }
  vector<vector<Cand>>().swap(unique);
+ auto validate_t1=chrono::steady_clock::now();
  size_t good_n=0,pending_n=0;
  for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();}
  vector<Evt> events;events.reserve(good_n+pending_n);
@@ -514,6 +516,8 @@ int main(){
  for(auto& v:resolved_pending){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(resolved_pending);
  vector<vector<PendingEvt>>().swap(pending_by_part);
+ auto validate_t2=chrono::steady_clock::now();
+ cerr<<"subphase winner_validate="<<chrono::duration<double>(validate_t1-validate_t0).count()<<"s standalone_resolve="<<chrono::duration<double>(validate_t2-validate_t1).count()<<"s\n";
  cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<pending_n<<"\n";lap("event_validate");
  // Clicks: parse + validate in parallel, then exact-dedup independent ID shards.
  auto click_paths=input_files(data+"/clicks");
