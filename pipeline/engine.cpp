@@ -895,10 +895,9 @@ int main(){
   duckdb_destroy_result(&qr);
  };
  fs::create_directories(out+"/user_daily");fs::create_directories(out+"/campaign_daily");
- string escout=out;size_t ep=0;while((ep=escout.find(''',ep))!=string::npos){escout.insert(ep,"'");ep+=2;}
  dq("SET threads="+to_string(max(1,ncpu)));
- dq("COPY (SELECT * FROM read_csv('"+escout+"/user_daily.csv', columns={'user_id':'VARCHAR','day':'DATE','sessions':'BIGINT','events':'BIGINT','revenue_cents':'BIGINT','top_category':'VARCHAR'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+escout+"/user_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
- dq("COPY (SELECT * FROM read_csv('"+escout+"/campaign_daily.csv', columns={'campaign_id':'VARCHAR','channel':'VARCHAR','day':'DATE','sessions':'BIGINT','purchasing_sessions':'BIGINT','revenue_cents':'BIGINT','assisted_sessions':'BIGINT'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+escout+"/campaign_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
+ dq("COPY (SELECT * FROM read_csv('"+out+"/user_daily.csv', columns={'user_id':'VARCHAR','day':'DATE','sessions':'BIGINT','events':'BIGINT','revenue_cents':'BIGINT','top_category':'VARCHAR'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+out+"/user_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
+ dq("COPY (SELECT * FROM read_csv('"+out+"/campaign_daily.csv', columns={'campaign_id':'VARCHAR','channel':'VARCHAR','day':'DATE','sessions':'BIGINT','purchasing_sessions':'BIGINT','revenue_cents':'BIGINT','assisted_sessions':'BIGINT'}, auto_detect=false, header=true, delim=',', new_line='\\n')) TO '"+out+"/campaign_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION LZ4_RAW, ROW_GROUP_SIZE 1000000)");
  duckdb_disconnect(&con);duckdb_close(&db);
  fs::remove(out+"/user_daily.csv");fs::remove(out+"/campaign_daily.csv");
  lap("parquet_output");
