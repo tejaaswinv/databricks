@@ -126,7 +126,7 @@ struct UnionFind{
 struct Cand{SV line,eventid;int64_t ingest;uint64_t idtag;}; // bit63=0 canonical numeric e-ID; bit63=1 hashed fallback
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
-struct ClickCand{SV clickid,user;uint32_t t;uint32_t person;uint32_t h24;uint16_t campaign;uint16_t unused=0;};
+struct ClickCand{SV clickid,user;uint64_t idtag;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
@@ -239,9 +239,12 @@ struct FlatClickCandIndex {
   size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);
  }
  bool insert(const ClickCand& c){
-  size_t p=c.h24&(buckets.size()-1);
+  size_t p=(size_t)c.idtag&(buckets.size()-1);
   while(buckets[p]){
-   if(rows[buckets[p]-1].clickid==c.clickid)return false;
+   const ClickCand& old=rows[buckets[p]-1];
+   if(c.idtag==old.idtag){
+    if((c.idtag>>63)==0 || c.clickid==old.clickid)return false;
+   }
    p=(p+1)&(buckets.size()-1);
   }
   buckets[p]=(uint32_t)rows.size()+1;
@@ -572,9 +575,11 @@ int main(){
     if(ci!=campaign_ids.end()){
      int64_t ts;
      if(parse_time(f[3],ts)&&ts>=ws-WEEK&&ts<we){
-      size_t h=Hash{}(f[0]);uint32_t hp=(uint32_t)h&0x00ffffffu;
+      uint64_t n,tag;
+      if(canonical_base36_id(f[0],'k',n))tag=n;
+      else tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
       uint32_t person=person_map.find_only(f[1]);
-      click_raw[tid*CPARTS+(h%CPARTS)].push_back({f[0],f[1],(uint32_t)(ts-(ws-WEEK)),person,hp,ci->second,0});
+      click_raw[tid*CPARTS+((size_t)tag%CPARTS)].push_back({f[0],f[1],tag,(uint32_t)(ts-(ws-WEEK)),person,ci->second,0});
      }
     }
    }
