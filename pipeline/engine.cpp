@@ -40,8 +40,16 @@ static int64_t epoch_days(int y,int m,int d){ // Howard Hinnant: proleptic Grego
  y-=m<=2; int era=(y>=0 ? y:y-399)/400; unsigned yoe=(unsigned)(y-era*400); unsigned doy=(153*(m+(m>2?-3:9))+2)/5+d-1; unsigned yoe_days=yoe*365+yoe/4-yoe/100+doy; return int64_t(era)*146097+yoe_days-719468;
 }
 static bool parse_time(SV s,int64_t &val){
- if(digits(s)) { unsigned long long n=0; for(unsigned char ch:s){unsigned d=ch-'0'; if(n>(uint64_t(INT64_MAX)-d)/10)return false;n=n*10+d;}val=(int64_t)n;return true; }
- if(s.size()!=20 && s.size()!=25)return false;
+ // F1/F2 are fixed-width. Everything else can only be F3 and is validated in one pass.
+ if(s.size()!=20 && s.size()!=25){
+  if(s.empty())return false;
+  uint64_t n=0;
+  for(unsigned char ch:s){
+   if(ch<'0'||ch>'9')return false;
+   unsigned d=ch-'0';if(n>(uint64_t(INT64_MAX)-d)/10)return false;n=n*10+d;
+  }
+  val=(int64_t)n;return true;
+ }
  const char* p=s.data();
  if(p[4]!='-'||p[7]!='-'||p[10]!='T'||p[13]!=':'||p[16]!=':')return false;
  if(s.size()==20 && p[19]!='Z')return false;
