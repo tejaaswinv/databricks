@@ -19,13 +19,13 @@ COPY (
     columns={'user_id':'VARCHAR','day':'DATE','sessions':'BIGINT','events':'BIGINT','revenue_cents':'BIGINT','top_category':'VARCHAR'},
     auto_detect=false, header=true, delim=',', new_line='\\n'
   )
-) TO '$OUTPUT_DIR/user_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY);
+) TO '$OUTPUT_DIR/user_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED);
 COPY (
   SELECT * FROM read_csv(
     '$OUTPUT_DIR/campaign_daily.csv',
     columns={'campaign_id':'VARCHAR','channel':'VARCHAR','day':'DATE','sessions':'BIGINT','purchasing_sessions':'BIGINT','revenue_cents':'BIGINT','assisted_sessions':'BIGINT'},
     auto_detect=false, header=true, delim=',', new_line='\\n'
   )
-) TO '$OUTPUT_DIR/campaign_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY);
+) TO '$OUTPUT_DIR/campaign_daily/part-0.parquet' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED);
 " >/dev/null
 rm -f "$OUTPUT_DIR/user_daily.csv" "$OUTPUT_DIR/campaign_daily.csv"
