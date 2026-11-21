@@ -137,8 +137,7 @@ struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
-struct PendingEvt{SV user;uint32_t t;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused=0;};
-struct PendingNum{uint64_t key;SV user;uint32_t t;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused=0;};
+struct PendingEvt{SV user;uint32_t t;int32_t price;uint32_t user_hash;uint16_t category;uint8_t is_purchase;uint8_t unused=0;};
 struct CampDay{int64_t sessions=0,purchasing=0,revenue=0,assists=0;};
 // Open-addressing dedup index: cache-friendly, compact, collision-safe.
 // An entry stores the 1-based index into Cand; full keys are compared on match.
@@ -167,14 +166,15 @@ struct FastPeople {
   while(!buckets[p].key.empty())p=(p+1)&(buckets.size()-1);
   buckets[p]={key,person};used++;
  }
- uint32_t find_only(SV key) const {
-  size_t p=Hash{}(key)&(buckets.size()-1);
+ uint32_t find_hashed(SV key,size_t h) const {
+  size_t p=h&(buckets.size()-1);
   while(!buckets[p].key.empty()) {
     if(buckets[p].key==key)return buckets[p].person;
     p=(p+1)&(buckets.size()-1);
   }
   return UINT32_MAX;
  }
+ uint32_t find_only(SV key) const {return find_hashed(key,Hash{}(key));}
  uint32_t get(SV key) {
   if(used*10>=buckets.size()*7)grow();
   size_t p=Hash{}(key)&(buckets.size()-1);
@@ -186,20 +186,6 @@ struct FastPeople {
   people.push_back(key);
   buckets[p]={key,id}; used++;
   return id;
- }
-};
-struct FlatNumPeople{
- vector<uint64_t> keys;vector<uint32_t> vals;size_t used=0;
- explicit FlatNumPeople(size_t expected=16){size_t cap=16;while(cap<expected*2)cap<<=1;keys.assign(cap,0);vals.resize(cap);}
- void grow(){vector<uint64_t> nk(keys.size()*2,0);vector<uint32_t> nv(nk.size());size_t mask=nk.size()-1;
-  for(size_t i=0;i<keys.size();i++)if(keys[i]){uint64_t stored=keys[i];size_t p=(stored*0x9E3779B97F4A7C15ULL)&mask;while(nk[p])p=(p+1)&mask;nk[p]=stored;nv[p]=vals[i];}
-  keys.swap(nk);vals.swap(nv);
- }
- uint32_t find(uint64_t key)const{uint64_t stored=key+1;size_t p=(stored*0x9E3779B97F4A7C15ULL)&(keys.size()-1);
-  while(keys[p]){if(keys[p]==stored)return vals[p];p=(p+1)&(keys.size()-1);}return UINT32_MAX;
- }
- void add(uint64_t key,uint32_t person){if(used*10>=keys.size()*7)grow();uint64_t stored=key+1;size_t p=(stored*0x9E3779B97F4A7C15ULL)&(keys.size()-1);
-  while(keys[p]){if(keys[p]==stored){vals[p]=person;return;}p=(p+1)&(keys.size()-1);}keys[p]=stored;vals[p]=person;used++;
  }
 };
 struct FlatEventIndex {
@@ -404,26 +390,10 @@ int main(){
  vector<SV> people;
  vector<uint32_t> link_person(dsu.nodes.size());
  for(int i=0;i<(int)dsu.nodes.size();i++){int r=dsu.root(i);if(rootperson[r]<0){rootperson[r]=people.size();people.push_back(min_name[r]);}link_person[i]=rootperson[r];}
- FastPeople person_map(people,max<size_t>(2048,dsu.nodes.size()/64+64));
- FlatNumPeople numeric_people(dsu.nodes.size()+2000);
- for(size_t i=0;i<dsu.nodes.size();++i){
-  uint64_t k;
-  if(canonical_base36_id(dsu.nodes[i].value,'u',k))numeric_people.add(k,link_person[i]);
-  else person_map.add_link(dsu.nodes[i].value,link_person[i]);
- }
+ FastPeople person_map(people,dsu.nodes.size()+2000);
+ for(size_t i=0;i<dsu.nodes.size();++i)person_map.add_link(dsu.nodes[i].value,link_person[i]);
  dsu.index.clear();dsu.index.rehash(0);
- auto person_find=[&](SV name)->uint32_t{
-  uint64_t k;if(canonical_base36_id(name,'u',k))return numeric_people.find(k);
-  return person_map.find_only(name);
- };
- auto person_for=[&](SV name)->uint32_t{
-  uint64_t k;
-  if(canonical_base36_id(name,'u',k)){
-   uint32_t p=numeric_people.find(k);if(p!=UINT32_MAX)return p;
-   p=(uint32_t)people.size();people.push_back(name);numeric_people.add(k,p);return p;
-  }
-  return person_map.get(name);
- };
+ auto person_for=[&](SV name)->uint32_t{return person_map.get(name);};
  cerr<<"links nodes="<<dsu.nodes.size()<<"\n";lap("links_dims");
  // Event dedup happens before *all* event validation.
  // Batch parse in parallel, then independently deduplicate by exact event ID.
@@ -491,7 +461,7 @@ int main(){
       if(tp==2){int32_t pv=parse_price(f[6]);if(pv>0)price_code=(uint32_t)pv;}
       uint16_t user_code=span_code(line,f[1]),prod_code=span_code(line,f[5]);
       aux1=(uint64_t)user_code|((uint64_t)prod_code<<16)|((uint64_t)toff<<32);
-      aux2=(uint64_t)price_code|((uint64_t)tp<<24);
+      aux2=(uint64_t)price_code|((uint64_t)tp<<24)|((uint64_t)(uint32_t)Hash{}(f[1])<<32);
      }else{
       tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
       aux1=(uint64_t)(uintptr_t)f[0].data();aux2=f[0].size();
@@ -526,7 +496,6 @@ int main(){
  // are thread-safe. Only IDs absent from links are deferred for sequential insertion.
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
- vector<vector<PendingNum>> pending_num_by_part(PARTS);
  auto validate_t0=chrono::steady_clock::now();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
@@ -534,20 +503,21 @@ int main(){
  for(size_t part=0;part<PARTS;part++){
   auto& rows=unique[part];
   auto& good=valid_by_part[part];
-  auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
-  good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
+  auto& pending=pending_by_part[part];
+  good.reserve(rows.size());
+  pending.reserve(rows.size()/3+16);
   SV f[7];
   for(const Cand& c:rows){
-   SV user,prod;uint8_t tp;uint32_t t;int32_t price=0;
+   SV user,prod;uint8_t tp;uint32_t t,user_hash;int32_t price=0;
    if((c.idtag>>63)==0){
     user=cand_span16(c,0);prod=cand_span16(c,1);
-    t=(uint32_t)(c.aux1>>32);tp=(uint8_t)((c.aux2>>24)&3);
+    t=(uint32_t)(c.aux1>>32);tp=(uint8_t)((c.aux2>>24)&3);user_hash=(uint32_t)(c.aux2>>32);
     if(user.empty()||prod.empty()||tp==3||t==UINT32_MAX)continue;
     if(c.ingest-(ws+(int64_t)t)>DAY)continue;
     if(tp==2){price=(int32_t)(c.aux2&0xffffffu);if(price<=0)continue;}
    }else{
     if(!split_csv(c.line,7,f))continue;
-    user=f[1];prod=f[5];
+    user=f[1];prod=f[5];user_hash=(uint32_t)Hash{}(user);
     tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
     if(user.empty()||prod.empty()||tp==3)continue;
     int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||c.ingest-ts>DAY)continue;
@@ -556,40 +526,25 @@ int main(){
    }
    uint16_t cat=unknown;
    if(tp==2){auto it=products.find(prod);if(it!=products.end())cat=it->second;}
-   uint64_t uk;bool canon=canonical_base36_id(user,'u',uk);
-   uint32_t p=canon?numeric_people.find(uk):person_map.find_only(user);
+   uint32_t p=person_map.find_hashed(user,user_hash);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
-   else if(canon)pending_num.push_back({uk,user,t,price,cat,(uint8_t)(tp==2),0});
-   else pending.push_back({user,t,price,cat,(uint8_t)(tp==2),0});
+   else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
  }
  vector<vector<Cand>>().swap(unique);
  auto validate_t1=chrono::steady_clock::now();
- size_t good_n=0,pending_n=0,pending_num_n=0;
- for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();pending_num_n+=pending_num_by_part[part].size();}
- vector<Evt> events;events.reserve(good_n+pending_n+pending_num_n);
+ size_t good_n=0,pending_n=0;
+ for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();}
+ vector<Evt> events;events.reserve(good_n+pending_n);
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
-
- // Canonical standalone IDs: one radix grouping, then one person allocation per unique key.
- vector<PendingNum> pnums;pnums.reserve(pending_num_n);
- for(auto&v:pending_num_by_part){pnums.insert(pnums.end(),v.begin(),v.end());vector<PendingNum>().swap(v);}
- vector<vector<PendingNum>>().swap(pending_num_by_part);
- radix64(pnums,[](const PendingNum&e){return e.key;},3);
- for(size_t i=0;i<pnums.size();){
-  size_t j=i+1;while(j<pnums.size()&&pnums[j].key==pnums[i].key)j++;
-  uint32_t p=(uint32_t)people.size();people.push_back(pnums[i].user);numeric_people.add(pnums[i].key,p);
-  for(size_t z=i;z<j;z++){const auto&e=pnums[z];events.push_back({e.t,p,e.price,e.category,e.is_purchase,0});}
-  i=j;
- }
- vector<PendingNum>().swap(pnums);
-
- // Noncanonical standalone IDs are rare; keep the exact byte-string fallback.
- constexpr size_t ID_SHARDS=64;
+ // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
+ // so assignment order is irrelevant; every equal byte string still gets exactly one person.
+ constexpr size_t ID_SHARDS=256;
  array<unordered_map<SV,uint32_t,Hash,Eq>,ID_SHARDS> standalone;
  array<mutex,ID_SHARDS> standalone_mu;
- size_t per_shard=max<size_t>(8,pending_n/8/ID_SHARDS+4);
+ size_t per_shard=max<size_t>(16,pending_n/24/ID_SHARDS+8);
  for(auto& m:standalone)m.reserve(per_shard);
  uint32_t people_base=(uint32_t)people.size();
  people.resize((size_t)people_base+pending_n);
@@ -599,22 +554,37 @@ int main(){
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<PARTS;part++){
-  auto& src=pending_by_part[part];auto& dst=resolved_pending[part];dst.reserve(src.size());
+  auto& src=pending_by_part[part];
+  auto& dst=resolved_pending[part];
+  dst.reserve(src.size());
   for(const PendingEvt& e:src){
-   size_t h=Hash{}(e.user),sh=h&(ID_SHARDS-1);uint32_t p;
-   {lock_guard<mutex> lock(standalone_mu[sh]);auto&m=standalone[sh];auto it=m.find(e.user);
-    if(it==m.end()){p=next_person.fetch_add(1,memory_order_relaxed);m.emplace(e.user,p);people[p]=e.user;}else p=it->second;}
+   size_t h=e.user_hash, sh=h&(ID_SHARDS-1);
+   uint32_t p;
+   {
+    lock_guard<mutex> lock(standalone_mu[sh]);
+    auto& m=standalone[sh];
+    auto it=m.find(e.user);
+    if(it==m.end()){
+     p=next_person.fetch_add(1,memory_order_relaxed);
+     m.emplace(e.user,p);
+     people[p]=e.user;
+    }else p=it->second;
+   }
    dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
   }
   vector<PendingEvt>().swap(src);
  }
- uint32_t final_people=next_person.load(memory_order_relaxed);people.resize(final_people);
+ uint32_t final_people=next_person.load(memory_order_relaxed);
+ people.resize(final_people);
+ // Make the newly assigned IDs available to click processing. This is once per unique
+ // ID rather than once per event.
  for(uint32_t p=people_base;p<final_people;p++)person_map.add_link(people[p],p);
- for(auto&v:resolved_pending){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
- vector<vector<Evt>>().swap(resolved_pending);vector<vector<PendingEvt>>().swap(pending_by_part);
+ for(auto& v:resolved_pending){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
+ vector<vector<Evt>>().swap(resolved_pending);
+ vector<vector<PendingEvt>>().swap(pending_by_part);
  auto validate_t2=chrono::steady_clock::now();
  cerr<<"subphase winner_validate="<<chrono::duration<double>(validate_t1-validate_t0).count()<<"s standalone_resolve="<<chrono::duration<double>(validate_t2-validate_t1).count()<<"s\n";
- cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<(pending_n+pending_num_n)<<"\n";lap("event_validate");
+ cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<pending_n<<"\n";lap("event_validate");
  // Clicks: parse + validate in parallel, then exact-dedup independent ID shards.
  auto click_paths=input_files(data+"/clicks");
  vector<Work> click_chunks;
@@ -653,7 +623,7 @@ int main(){
       uint64_t n,tag;
       if(canonical_base36_id(f[0],'k',n))tag=n;
       else tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
-      uint32_t person=person_find(f[1]);
+      size_t uh=Hash{}(f[1]);uint32_t person=person_map.find_hashed(f[1],uh);
       click_raw[tid*CPARTS+((size_t)tag%CPARTS)].push_back({f[0],f[1],tag,(uint32_t)(ts-(ws-WEEK)),person,ci->second,0});
      }
     }
