@@ -100,7 +100,7 @@ struct UnionFind{
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
-struct Cand{SV user, ts, prod; int64_t ingest; int32_t price; uint8_t type;};
+struct Cand{SV eventid, user, ts, prod; int64_t ingest; int32_t price; uint8_t type;};
 struct Evt{int64_t ts;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{int64_t ts;uint32_t person;uint16_t campaign;SV clickid;};
 struct Assist{uint32_t person;uint16_t campaign;int64_t ts;};
@@ -108,6 +108,94 @@ struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
 struct CampDay{int64_t sessions=0,purchasing=0,revenue=0,assists=0;};
+// Open-addressing dedup index: cache-friendly, compact, collision-safe.
+// An entry stores the 1-based index into Cand; full keys are compared on match.
+struct FastPeople {
+ struct Slot {SV key; uint32_t person=0;};
+ vector<Slot> buckets;
+ size_t used=0;
+ vector<SV>& people;
+ explicit FastPeople(vector<SV>& names,size_t expected):people(names) {
+  size_t cap=16;while(cap < expected * 2)cap <<= 1;
+  buckets.resize(cap);
+ }
+ void grow() {
+  vector<Slot> bigger(buckets.size()*2);
+  size_t mask=bigger.size()-1;
+  for(const auto& e:buckets)if(!e.key.empty()){
+    size_t i=hash<SV>{}(e.key)&mask;
+    while(!bigger[i].key.empty())i=(i+1)&mask;
+    bigger[i]=e;
+  }
+  buckets.swap(bigger);
+ }
+ void add_link(SV key,uint32_t person) {
+  if(used*10>=buckets.size()*7)grow();
+  size_t p=hash<SV>{}(key)&(buckets.size()-1);
+  while(!buckets[p].key.empty())p=(p+1)&(buckets.size()-1);
+  buckets[p]={key,person};used++;
+ }
+ uint32_t get(SV key) {
+  if(used*10>=buckets.size()*7)grow();
+  size_t p=hash<SV>{}(key)&(buckets.size()-1);
+  while(!buckets[p].key.empty()) {
+    if(buckets[p].key==key)return buckets[p].person;
+    p=(p+1)&(buckets.size()-1);
+  }
+  uint32_t id=(uint32_t)people.size();
+  people.push_back(key);
+  buckets[p]={key,id}; used++;
+  return id;
+ }
+};
+struct FlatEventIndex {
+ vector<uint32_t> buckets;
+ size_t used = 0;
+ vector<Cand>& rows;
+ explicit FlatEventIndex(vector<Cand>& v,size_t expected):rows(v) {
+   size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
+   buckets.assign(cap,0);
+ }
+ uint32_t get_or_create(SV key) {
+   if(used*10>=buckets.size()*7)grow();
+   size_t mask=buckets.size()-1;
+   size_t p=hash<SV>{}(key)&mask;
+   for(;;) {
+     uint32_t v=buckets[p];
+     if(!v) {
+       uint32_t id=(uint32_t)rows.size();
+       buckets[p]=id+1;used++;
+       return UINT32_MAX;
+     }
+     if(rows[v-1].eventid==key)return v-1;
+     p=(p+1)&mask;
+   }
+ }
+ void grow() {
+   vector<uint32_t> nb(buckets.size()*2,0);
+   size_t mask=nb.size()-1;
+   for(uint32_t v:buckets) if(v) {
+     size_t p=hash<SV>{}(rows[v-1].eventid)&mask;
+     while(nb[p])p=(p+1)&mask;
+     nb[p]=v;
+   }
+   buckets.swap(nb);
+ }
+};
+struct FlatClickSet {
+ vector<uint32_t> buckets;
+ vector<Click> &rows;
+ size_t used=0;
+ explicit FlatClickSet(vector<Click>& r,size_t expected):rows(r){size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);}
+ void grow(){vector<uint32_t> nb(buckets.size()*2);size_t mask=nb.size()-1;
+  for(uint32_t v:buckets)if(v){size_t p=hash<SV>{}(rows[v-1].clickid)&mask;while(nb[p])p=(p+1)&mask;nb[p]=v;}
+  buckets.swap(nb);
+ }
+ bool insert(SV k){if(used*10>=buckets.size()*7)grow();size_t p=hash<SV>{}(k)&(buckets.size()-1);
+  while(buckets[p]){if(rows[buckets[p]-1].clickid==k)return false;p=(p+1)&(buckets.size()-1);}
+  buckets[p]=(uint32_t)rows.size()+1;used++;return true;
+ }
+};
 static int64_t parse_ingest(SV s){int64_t x;return parse_time(s,x)?x:INT64_MAX;}
 static int32_t parse_price(SV s) {
  if(!digits(s))return -1;
@@ -183,11 +271,12 @@ int main(){
  vector<SV> people;
  vector<uint32_t> link_person(dsu.nodes.size());
  for(int i=0;i<(int)dsu.nodes.size();i++){int r=dsu.root(i);if(rootperson[r]<0){rootperson[r]=people.size();people.push_back(min_name[r]);}link_person[i]=rootperson[r];}
- unordered_map<SV,uint32_t,Hash,Eq> singles;
- auto person_for=[&](SV name)->uint32_t{auto it=dsu.index.find(name);if(it!=dsu.index.end())return link_person[it->second];auto si=singles.find(name);if(si!=singles.end())return si->second;uint32_t id=people.size();people.push_back(name);singles.emplace(name,id);return id;};
+ FastPeople person_map(people,dsu.nodes.size()+2000);
+ for(size_t i=0;i<dsu.nodes.size();++i)person_map.add_link(dsu.nodes[i].value,link_person[i]);
+ dsu.index.clear();dsu.index.rehash(0);
+ auto person_for=[&](SV name)->uint32_t{return person_map.get(name);};
  cerr<<"links nodes="<<dsu.nodes.size()<<"\n";
  // Event dedup happens before *all* event validation.
- unordered_map<SV,uint32_t,Hash,Eq> event_idx;
  vector<Cand> candidates;
  // Sample a few raw lines to avoid expensive vector reallocations and hash rehashes
  // at 20-60 million events; no data content or generator shape is assumed.
@@ -201,23 +290,24 @@ int main(){
  }
  size_t event_capacity=2000000;
  if(sample_lines&&sample_bytes){event_capacity=max<size_t>(1000, (long double)total_bytes*sample_lines/sample_bytes*1.05L);}
- event_idx.reserve(event_capacity);candidates.reserve(event_capacity);
+ candidates.reserve(event_capacity);
+ FlatEventIndex event_idx(candidates,event_capacity);
  for(auto&p:event_paths){
   maps.emplace_back(p);
   foreach_csv(maps.back(),7,[&](SV*f){
     if(f[0].empty())return;
     int64_t ing=parse_ingest(f[3]); // ingest guaranteed F1 by the problem spec
-    auto it=event_idx.find(f[0]);
-    if(it==event_idx.end()){
+    uint32_t ix=event_idx.get_or_create(f[0]);
+    if(ix==UINT32_MAX){
       uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-      event_idx.emplace(f[0],candidates.size());candidates.push_back({f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp});
-    } else if(ing<candidates[it->second].ingest){
+      candidates.push_back({f[0],f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp});
+    } else if(ing<candidates[ix].ingest){
       uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-      candidates[it->second]={f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp};
+      candidates[ix]={f[0],f[1],f[2],f[5],ing,(tp==2?parse_price(f[6]):0),tp};
     }
   });
  }
- event_idx.clear();event_idx.rehash(0);
+ event_idx.buckets.clear();event_idx.buckets.shrink_to_fit();
  vector<Evt> events;events.reserve(candidates.size());
  for(const Cand& c:candidates){
   if(c.user.empty()||c.prod.empty()||c.type==3)continue;
@@ -232,19 +322,19 @@ int main(){
  vector<Cand>().swap(candidates);
  cerr<<"valid events="<<events.size()<<" people="<<people.size()<<"\n";
  // Clicks: identical duplicates can safely be deduped after validation.
- unordered_set<SV,Hash,Eq> click_seen;
  vector<Click> clicks;clicks.reserve(max<size_t>(1000,events.size()/4));
+ FlatClickSet click_seen(clicks,max<size_t>(1000,events.size()/4));
  for(auto&p:input_files(data+"/clicks")){
   maps.emplace_back(p);
   foreach_csv(maps.back(),4,[&](SV*f){
    if(f[0].empty()||f[1].empty())return;
    auto it=campaign_ids.find(f[2]);if(it==campaign_ids.end())return;
    int64_t ts;if(!parse_time(f[3],ts)||ts<ws-WEEK||ts>=we)return;
-   if(!click_seen.insert(f[0]).second)return;
+   if(!click_seen.insert(f[0]))return;
    clicks.push_back({ts,person_for(f[1]),it->second,f[0]});
   });
  }
- click_seen.clear();click_seen.rehash(0);
+ click_seen.buckets.clear();click_seen.buckets.shrink_to_fit();
  cerr<<"valid clicks="<<clicks.size()<<"\n";
  // Sessions from globally sorted valid events, across every linked ID.
  order_events(events);
