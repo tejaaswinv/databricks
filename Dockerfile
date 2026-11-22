@@ -2,6 +2,7 @@ FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
 COPY pipeline/engine.cpp /app/engine.cpp
 COPY pipeline/native_parquet.hpp /app/native_parquet.hpp
+COPY pipeline/csv_reader.hpp /app/csv_reader.hpp
 RUN g++ -std=c++20 -O3 -march=x86-64 -fopenmp -flto -fno-semantic-interposition -fno-plt -DNDEBUG -I/app -o /app/engine /app/engine.cpp
 
 FROM debian:bookworm-slim
