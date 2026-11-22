@@ -184,7 +184,7 @@ struct PackedNumPeople {
  vector<uint64_t> slots;
  vector<uint32_t> wide_values;
  size_t used=0;
- explicit PackedNumPeople(size_t expected=16){size_t cap=16;while(cap<expected*10/7+16)cap*=2;slots.resize(cap);}
+ explicit PackedNumPeople(size_t expected=16){size_t cap=16;while(cap<expected*2+16)cap*=2;slots.resize(cap);}
  static size_t hash_key(uint64_t key){return (key+1)*0x9E3779B97F4A7C15ULL;}
  uint64_t key_at(size_t i)const{return wide_values.empty()?(slots[i]&KEY_MASK):slots[i]-1;}
  uint32_t value_at(size_t i)const{return wide_values.empty()?uint32_t(slots[i]>>40)-1:wide_values[i];}
@@ -211,7 +211,7 @@ struct PackedNumPeople {
   return UINT32_MAX;
  }
  void add(uint64_t key,uint32_t value){
-  if(used*10>=slots.size()*7)grow();
+  if(used*2>=slots.size())grow();
   size_t p=hash_key(key)&(slots.size()-1);
   while(slots[p]){if(key_at(p)==key){set_at(p,key,value);return;}p=(p+1)&(slots.size()-1);}
   set_at(p,key,value);used++;
