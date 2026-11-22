@@ -781,7 +781,7 @@ int main(){
 
   auto& good=valid_by_part[part];
   auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
-  good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
+  good.reserve(n);pending.reserve(32);pending_num.reserve(n/3+16);
   SV f[7];
   auto emit=[&](const Cand& c){
    SV user,prod;uint8_t tp;uint32_t t,user_hash=0;uint64_t uk=UINT64_MAX;int32_t price=0;uint16_t cat=unknown;
