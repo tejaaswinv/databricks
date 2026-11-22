@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -694,16 +695,19 @@ int main(){
  }
  constexpr size_t PARTS=256;
  const size_t workers=max(1,ncpu);
- vector<vector<Cand>> raw(workers*PARTS);
- for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
+ vector<vector<Cand>> winners(PARTS);
+ vector<unique_ptr<FlatEventIndex>> winner_index;winner_index.reserve(PARTS);
+ array<atomic_flag,PARTS> winner_lock;
+ size_t per_part=max<size_t>(64,(size_t)(event_capacity*1.02/PARTS)+32);
+ for(size_t part=0;part<PARTS;part++){
+  winner_lock[part].clear(memory_order_relaxed);
+  winners[part].reserve(per_part);
+  winner_index.emplace_back(make_unique<FlatEventIndex>(winners[part],per_part,countr_zero(PARTS)));
+ }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t ch=0;ch<chunks.size();ch++){
-  size_t tid=0;
-#ifdef _OPENMP
-  tid=(size_t)omp_get_thread_num();
-#endif
   const char* p=chunks[ch].begin;const char* end=chunks[ch].end;
   SV f[7];
   while(p<end){
@@ -727,6 +731,7 @@ int main(){
      int64_t ingest_sec=ingest/1000;
      int64_t ingest_code=ingest_sec-(ws-WEEK)/1000;
      compact=compact && cat<=255 && ingest_code>=0 && ingest_code<(1LL<<22);
+     Cand c;
      if(compact){
       tag=n;
       x0=(uk&MASK40)|((uint64_t)(toff&0xffffffU)<<40);
@@ -738,11 +743,19 @@ int main(){
       uint64_t sec40=(uint64_t)ingest_sec&0xffffffffffULL;
       x1=(uint64_t)line.size()|(sec40<<24);
      }
-     raw[tid*PARTS+((size_t)(tag&~NONCOMPACT_PAYLOAD)%PARTS)].push_back({x0,x1,tag});
+     c={x0,x1,tag};
+     size_t part=(size_t)(tag&~NONCOMPACT_PAYLOAD)%PARTS;
+     while(winner_lock[part].test_and_set(memory_order_acquire)){}
+     auto& rows=winners[part];
+     uint32_t ix=winner_index[part]->get_or_create(c);
+     if(ix==UINT32_MAX)rows.push_back(c);
+     else if(cand_ingest_ms(c,ws)<cand_ingest_ms(rows[ix],ws))rows[ix]=c;
+     winner_lock[part].clear(memory_order_release);
    }
   }
  }
- lap("event_parse");
+ winner_index.clear();
+ lap("event_parse_dedup");
  vector<IdentityCache> event_people_cache(workers);
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
@@ -757,19 +770,7 @@ int main(){
   lookup_tid=(size_t)omp_get_thread_num();
 #endif
   auto& cache=event_people_cache[lookup_tid];
-  size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
-  vector<Cand> cands;cands.reserve(n);
-  FlatEventIndex idx(cands,n,countr_zero(PARTS));
-  for(size_t t=0;t<workers;t++){
-   auto& rows=raw[t*PARTS+part];
-   for(const Cand& c:rows){
-      uint32_t ix=idx.get_or_create(c);
-      if(ix==UINT32_MAX)cands.push_back(c);
-      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
-   }
-   vector<Cand>().swap(rows);
-  }
-  auto& rows=cands;
+  auto& rows=winners[part];
   auto& good=valid_by_part[part];
   auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
   good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
@@ -802,8 +803,8 @@ int main(){
   }
   vector<Cand>().swap(rows);
  }
- vector<vector<Cand>>().swap(raw);
- lap("event_dedup_validate");
+ vector<vector<Cand>>().swap(winners);
+ lap("event_validate");
  auto validate_t1=chrono::steady_clock::now();
  size_t good_n=0,pending_n=0,pending_num_n=0;
  for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();pending_num_n+=pending_num_by_part[part].size();}
