@@ -704,11 +704,12 @@ int main(){
 #ifdef _OPENMP
   tid=(size_t)omp_get_thread_num();
 #endif
-  const char* p=chunks[ch].begin;const char* end=chunks[ch].end;
-  SV f[7];
-  while(p<end){
-   const char* first=p;
-   if(exactcsv::events(p,end,7,f)&&!f[0].empty()){
+  const char* begin=chunks[ch].begin;const char* end=chunks[ch].end;
+  auto consume_events=[&](auto reader){
+   const char* p=begin;SV f[7];
+   while(p<end){
+    const char* first=p;
+    if(reader(p,end,7,f)&&!f[0].empty()){
      const char* last=p==end&&p[-1]!='\n'?end:p-1;
      SV line(first,last-first);
      uint64_t n=0,tag,uk=0,x0,x1;int32_t ingest_day;int64_t ingest=parse_ingest(f[3],ingest_day);
@@ -739,10 +740,22 @@ int main(){
       x1=(uint64_t)line.size()|(sec40<<24);
      }
      raw[tid*PARTS+((size_t)(tag&~NONCOMPACT_PAYLOAD)%PARTS)].push_back({x0,x1,tag});
+    }
    }
-  }
+  };
+#if defined(__x86_64__)
+  __builtin_cpu_init();
+  if(__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
+   consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx512<7>(p,e,7,f);});
+  else if(__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
+   consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx2<7>(p,e,7,f);});
+  else consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::next_sse2<7>(p,e,7,f);});
+#else
+  consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::events(p,e,7,f);});
+#endif
  }
  lap("event_parse");
+ vector<IdentityCache> event_people_cache(workers);
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
  vector<vector<PendingNum>> pending_num_by_part(PARTS);
@@ -751,6 +764,11 @@ int main(){
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<PARTS;part++){
+  size_t lookup_tid=0;
+#ifdef _OPENMP
+  lookup_tid=(size_t)omp_get_thread_num();
+#endif
+  auto& cache=event_people_cache[lookup_tid];
   size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
   vector<Cand> cands;cands.reserve(n);
   FlatEventIndex idx(cands,n,countr_zero(PARTS));
@@ -789,14 +807,10 @@ int main(){
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
    }
-   if(uk!=UINT64_MAX){
-    // Resolve canonical aliases once per cache-local numeric shard below.
-    pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
-   }else{
-    uint32_t p=person_map.find_hashed(user,user_hash);
-    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
-    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
-   }
+   uint32_t p=(uk!=UINT64_MAX)?cache.find(numeric_people,uk):person_map.find_hashed(user,user_hash);
+   if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
+   else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
+   else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
  }
@@ -808,9 +822,8 @@ int main(){
  vector<Evt> events;events.reserve(good_n+pending_n+pending_num_n);
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
- // Partition every canonical numeric identity once. Each private shard resolves
- // a distinct alias against the linked-ID map only on first occurrence; repeated
- // events stay inside a cache-local table.
+ // Partition unresolved numeric identities once, then intern each shard without
+ // locks. Repeated events no longer revisit one large mutable identity table.
  constexpr size_t NUM_SHARDS=256;
  vector<size_t> numeric_counts(PARTS*NUM_SHARDS),numeric_offsets(PARTS*NUM_SHARDS);
 #ifdef _OPENMP
@@ -861,13 +874,9 @@ int main(){
    uint64_t local_key=e.key/NUM_SHARDS;
    uint32_t p=local.find(local_key);
    if(p==UINT32_MAX){
-    p=numeric_people.find(e.key);
-    if(p==UINT32_MAX){
-     p=next_numeric.fetch_add(1,memory_order_relaxed);
-     names.push_back(canonical_user_name(e.key));people[p]=names.back();
-     identities.push_back({e.key,p});
-    }
-    local.add(local_key,p);
+    p=next_numeric.fetch_add(1,memory_order_relaxed);
+    names.push_back(canonical_user_name(e.key));people[p]=names.back();
+    local.add(local_key,p);identities.push_back({e.key,p});
    }
    events[good_n+i]={e.t,p,e.price,e.category,e.is_purchase,0};
   }
@@ -949,9 +958,11 @@ int main(){
 #ifdef _OPENMP
   tid=(size_t)omp_get_thread_num();
 #endif
-  const char* p=click_chunks[ch].begin;const char* end=click_chunks[ch].end;SV f[4];
-  while(p<end){
-   if(exactcsv::clicks(p,end,4,f)&&!f[0].empty()&&!f[1].empty()){
+  const char* begin=click_chunks[ch].begin;const char* end=click_chunks[ch].end;
+  auto consume_clicks=[&](auto reader){
+   const char* p=begin;SV f[4];
+   while(p<end){
+    if(reader(p,end,4,f)&&!f[0].empty()&&!f[1].empty()){
     uint16_t cid=campaign_for(f[2]);
     if(cid!=UINT16_MAX){
      int64_t ts;
@@ -969,7 +980,18 @@ int main(){
      }
     }
    }
-  }
+   }
+  };
+#if defined(__x86_64__)
+  __builtin_cpu_init();
+  if(__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
+   consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx512<4>(p,e,4,f);});
+  else if(__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
+   consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx2<4>(p,e,4,f);});
+  else consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::next_sse2<4>(p,e,4,f);});
+#else
+  consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::clicks(p,e,4,f);});
+#endif
  }
  vector<vector<Click>> click_unique(CPARTS);
 #ifdef _OPENMP
