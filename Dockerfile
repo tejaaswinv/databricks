@@ -9,10 +9,10 @@ RUN g++ -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-
 CMD ["/app/engine-test"]
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libstdc++6 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libstdc++6 libtcmalloc-minimal4 && rm -rf /var/lib/apt/lists/*
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=builder /app/engine /app/engine
 RUN chmod 755 /app/engine
-ENV OMP_PROC_BIND=true OMP_PLACES=cores
+ENV OMP_PROC_BIND=true OMP_PLACES=cores LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
 WORKDIR /app
 CMD ["/app/engine"]
