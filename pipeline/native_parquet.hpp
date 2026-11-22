@@ -10,6 +10,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef NATIVEPQ_SNAPPY
+#include <snappy.h>
+#endif
 
 namespace nativepq {
 using SV = std::string_view;
@@ -19,7 +22,12 @@ enum class Kind : int32_t { I32=1, I64=2, BYTE_ARRAY=6 };
 static constexpr int32_t REP_REQUIRED=0, REP_OPTIONAL=1;
 static constexpr int32_t CONV_UTF8=0, CONV_DATE=6;
 static constexpr int32_t ENC_PLAIN=0, ENC_RLE=3;
-static constexpr int32_t CODEC_UNCOMPRESSED=0, PAGE_DATA=0;
+static constexpr int32_t PAGE_DATA=0;
+#ifdef NATIVEPQ_SNAPPY
+static constexpr int32_t CODEC=1;
+#else
+static constexpr int32_t CODEC=0;
+#endif
 
 enum CType : uint8_t {
   C_STOP=0, C_TRUE=1, C_FALSE=2, C_BYTE=3, C_I16=4, C_I32=5,
@@ -73,6 +81,7 @@ struct Field {
 struct Chunk {
   int64_t offset=0;
   int64_t total=0;
+  int64_t uncompressed=0;
   int64_t values=0;
 };
 struct RowGroup {
@@ -86,6 +95,7 @@ class FileWriter {
   std::vector<Field> schema_;
   std::vector<RowGroup> groups_;
   int64_t rows_=0;
+  std::vector<uint8_t> compressed_,page_,header_;
   static constexpr size_t PAGE_ROWS=131072;
 
   template<class Present>
@@ -102,13 +112,12 @@ class FileWriter {
     return out;
   }
 
-  void page_header(int32_t slots,size_t def_bytes,size_t value_bytes,bool optional,std::vector<uint8_t>& out){
-    const size_t data_bytes=def_bytes+value_bytes;
+  void page_header(int32_t slots,size_t data_bytes,size_t compressed_bytes,std::vector<uint8_t>& out){
     if(data_bytes>INT32_MAX)throw std::runtime_error("parquet page too large");
     Compact h;
     h.i32(1,PAGE_DATA);
     h.i32(2,int32_t(data_bytes));
-    h.i32(3,int32_t(data_bytes));
+    h.i32(3,int32_t(compressed_bytes));
     h.begin_struct(5);
     h.i32(1,slots);
     h.i32(2,ENC_PLAIN);
@@ -117,6 +126,32 @@ class FileWriter {
     h.end_struct();
     h.stop();
     out.swap(h.b);
+  }
+
+  void write_page(Chunk& chunk,int32_t slots,const std::vector<uint8_t>& defs,const std::vector<uint8_t>& vals){
+    const size_t data_bytes=defs.size()+vals.size();
+#ifdef NATIVEPQ_SNAPPY
+    const uint8_t* source=vals.data();
+    if(!defs.empty()){
+      page_.clear();page_.reserve(data_bytes);
+      page_.insert(page_.end(),defs.begin(),defs.end());
+      page_.insert(page_.end(),vals.begin(),vals.end());
+      source=page_.data();
+    }
+    compressed_.resize(snappy::MaxCompressedLength(data_bytes));
+    size_t compressed_bytes=compressed_.size();
+    snappy::RawCompress(reinterpret_cast<const char*>(source),data_bytes,
+                        reinterpret_cast<char*>(compressed_.data()),&compressed_bytes);
+    compressed_.resize(compressed_bytes);
+    page_header(slots,data_bytes,compressed_bytes,header_);
+    raw(f_,header_);raw(f_,compressed_);
+#else
+    const size_t compressed_bytes=data_bytes;
+    page_header(slots,data_bytes,data_bytes,header_);
+    raw(f_,header_);raw(f_,defs);raw(f_,vals);
+#endif
+    chunk.total+=int64_t(header_.size()+compressed_bytes);
+    chunk.uncompressed+=int64_t(header_.size()+data_bytes);
   }
 
 public:
@@ -129,7 +164,7 @@ public:
   template<class Present,class Getter>
   Chunk write_string_col(size_t first,size_t last,bool optional,Present present,Getter get){
     Chunk ch;ch.offset=int64_t(f_.tellp());ch.values=int64_t(last-first);
-    std::vector<uint8_t> vals,defs,hdr;
+    std::vector<uint8_t> vals,defs;
     for(size_t row=first;row<last;){
       size_t n=std::min(PAGE_ROWS,last-row);
       vals.clear();vals.reserve(n*12);
@@ -143,9 +178,7 @@ public:
       }
       defs.clear();
       if(optional)defs=def_levels(row,n,present);
-      page_header(int32_t(n),defs.size(),vals.size(),optional,hdr);
-      raw(f_,hdr);raw(f_,defs);raw(f_,vals);
-      ch.total+=int64_t(hdr.size()+defs.size()+vals.size());
+      write_page(ch,int32_t(n),defs,vals);
       row+=n;
     }
     return ch;
@@ -154,13 +187,12 @@ public:
   template<class Getter>
   Chunk write_i64_col(size_t first,size_t last,Getter get){
     Chunk ch;ch.offset=int64_t(f_.tellp());ch.values=int64_t(last-first);
-    std::vector<uint8_t> vals,hdr;
+    std::vector<uint8_t> vals;
     for(size_t row=first;row<last;){
       size_t n=std::min(PAGE_ROWS,last-row);
       vals.clear();vals.reserve(n*8);
       for(size_t i=0;i<n;i++)le64(vals,uint64_t(int64_t(get(row+i))));
-      page_header(int32_t(n),0,vals.size(),false,hdr);
-      raw(f_,hdr);raw(f_,vals);ch.total+=int64_t(hdr.size()+vals.size());row+=n;
+      write_page(ch,int32_t(n),{},vals);row+=n;
     }
     return ch;
   }
@@ -168,20 +200,19 @@ public:
   template<class Getter>
   Chunk write_i32_col(size_t first,size_t last,Getter get){
     Chunk ch;ch.offset=int64_t(f_.tellp());ch.values=int64_t(last-first);
-    std::vector<uint8_t> vals,hdr;
+    std::vector<uint8_t> vals;
     for(size_t row=first;row<last;){
       size_t n=std::min(PAGE_ROWS,last-row);
       vals.clear();vals.reserve(n*4);
       for(size_t i=0;i<n;i++)le32(vals,uint32_t(int32_t(get(row+i))));
-      page_header(int32_t(n),0,vals.size(),false,hdr);
-      raw(f_,hdr);raw(f_,vals);ch.total+=int64_t(hdr.size()+vals.size());row+=n;
+      write_page(ch,int32_t(n),{},vals);row+=n;
     }
     return ch;
   }
 
   void add_group(std::vector<Chunk> cols,size_t rows){
     RowGroup g;g.cols=std::move(cols);g.rows=int64_t(rows);
-    for(auto&c:g.cols)g.bytes+=c.total;
+    for(auto&c:g.cols)g.bytes+=c.uncompressed;
     rows_+=g.rows;groups_.push_back(std::move(g));
   }
 
@@ -212,9 +243,9 @@ public:
         m.list_field(2,fld.optional?2:1,C_I32);
         m.z32(ENC_PLAIN);if(fld.optional)m.z32(ENC_RLE);
         m.list_field(3,1,C_BINARY);m.varu(fld.name.size());m.b.insert(m.b.end(),fld.name.begin(),fld.name.end());
-        m.i32(4,CODEC_UNCOMPRESSED);
+        m.i32(4,CODEC);
         m.i64(5,c.values);
-        m.i64(6,c.total);
+        m.i64(6,c.uncompressed);
         m.i64(7,c.total);
         m.i64(9,c.offset);
         m.end_struct();

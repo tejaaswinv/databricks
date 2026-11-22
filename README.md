@@ -1,16 +1,8 @@
 # Shopping Sessions (shopping-sessions-4)
 
-A fast, exact shopping-session ETL implementation for the [JoinBuilders buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions).
+An exact C++20/OpenMP implementation for the [JoinBuilders Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads every input CSV and writes the two final Parquet tables directly. Snappy is linked statically; no Python, DuckDB, network access, or intermediate output conversion is needed at runtime.
 
-**Stack:** C++20 (native optimized engine, union-find, linear time attribution, merged campaign-assist windows) + DuckDB 1.5.6 (typed Parquet output).
-
-## Validation
-
-- All **36/36** official CSV edge-case fixtures passed.
-- Official Rust generator, seed 1, 1,000,000 events + 250,000 clicks: **MATCH** against `dev-answer.zip`.
-- `user_daily`: 117,038 rows, 0 missing/extra/different; `campaign_daily`: 27,400 rows, 0 missing/extra/different; 0 duplicate output keys.
-- GitHub Actions runs the Docker image with a read-only filesystem, uid 1000, disabled networking, and capped resources. [Validation logs](https://github.com/tejaaswinv/databricks/actions).
-- Native engine reported **0.819 seconds** for the official 1M dev set on a GitHub Actions runner; that figure excludes container startup and Parquet conversion. No official hidden practice score is claimed.
+The practice workload is about 20 million events; the final is about 60 million. A sub-second dev-set result is not a practice score. Only an official run establishes leaderboard placement.
 
 ## Run
 
@@ -20,6 +12,7 @@ mkdir -p out scratch
 chmod a+rwx out scratch
 docker run --rm --platform linux/amd64 --network none --read-only \
   --tmpfs /tmp:rw,size=64m,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges \
   --cpus 8 --memory 24g --memory-swap 24g --user 1000:1000 \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch \
   -e HOME=/scratch -e NCPU=8 -e MEM_GB=24 \
@@ -27,17 +20,33 @@ docker run --rm --platform linux/amd64 --network none --read-only \
   shopping-sessions
 ```
 
-The container writes `/output/user_daily/part-0.parquet` and `/output/campaign_daily/part-0.parquet`, with exact columns and a Parquet `DATE` type for `day`.
+Use an empty output directory for each run. The image writes one or more Parquet files directly into `user_daily/` and `campaign_daily/`, including schema-only files when a table is empty. `day` is a Parquet DATE and `top_category` is nullable. The same Dockerfile also supports native ARM64 builds for development; submit a `linux/amd64` image.
 
 ## Algorithm
 
-1. Parse every CSV line using the exact dialect (quoted complete fields, no CSV `\\r` newline shortcut).
-2. Compute transitive user identity and byte-wise smallest representative by **union-find**.
-3. **Deduplicate events before validating** the winning, earliest-ingested copies.
-4. Validate event timestamps, prices, types, product IDs, and 24-hour lateness.
-5. Sort events by (person, timestamp), open sessions only on a gap **greater than** 30 minutes, and aggregate by UTC session-start date.
-6. Deduplicate and validate clicks; sort by (person, click timestamp, reverse byte-wise click ID), then attribute each session to its latest qualifying click.
-7. Merge seven-day intervals per (person, campaign), using binary searches into sorted session starts to count unique assisted sessions without a huge range join.
-8. Emit aggregated CSVs and convert them into two correctly typed Parquet tables using DuckDB, deleting the temporary CSVs.
+1. Scan CSV delimiters, newlines, and quotes together. Runtime dispatch selects AVX-512BW, AVX2, SSE2, or NEON, with bounded reads and a scalar fallback for long lines and final fragments. Validate the exact dialect, including ordinary carriage returns and quoted empty fields.
+2. Intern linked identities, compute transitive components, and select the byte-wise smallest name. Packed numeric indexes have an exact string fallback and promote to full-width internal indexes when necessary.
+3. Parse compact event candidates, preserving invalid candidates until deduplication chooses the earliest ingestion. Reuse already validated ingestion dates where they match the event date.
+4. Deduplicate independent event-ID partitions and validate each partition's winners while the data is local. Hash-table lookup uses bits beyond the partition selector, avoiding correlated probe chains.
+5. Resolve standalone numeric identities in independent shards. Sort surviving events by person/time, then count and fill session output ranges in parallel over whole people.
+6. Attribute each person's sessions and merge seven-day campaign-assist intervals in the same parallel work unit. Reduce private campaign totals once. Sum purchase categories per person/day with exact byte-wise tie-breaking.
+7. Write Snappy-compressed Parquet pages directly from final aggregate arrays, with correct compressed and uncompressed metadata lengths.
 
-The implementation does not depend on the fixture names, seed, ID ranges, campaign cardinalities, or hardcoded window boundaries. Logs are written to stderr.
+Fast paths do not normalize IDs or depend on a dataset seed, fixture name, date window, or particular dimension cardinality. Progress and timing logs go to stderr.
+
+## Validation and benchmarking
+
+The workflow checks all 36 official edge fixtures, compares the seed-1 1M dev set with the official answer, compares a second seed with the previous implementation, and benchmarks 20M events plus 5M clicks against the previous main commit. Parser differential fuzzing, identity index promotion, timestamp boundaries, and sorting under an OpenMP thread limit run with AddressSanitizer and UndefinedBehaviorSanitizer.
+
+```bash
+docker build --platform linux/amd64 --target tests -t shopping-sessions:tests .
+docker run --rm --platform linux/amd64 --network none \
+  -e OMP_THREAD_LIMIT=2 shopping-sessions:tests
+
+python3 scripts/benchmark.py --data bench --output benchmark-results \
+  --image shopping-sessions --baseline-image shopping-sessions:baseline \
+  --cpus 8 --memory 24g --runs 5 \
+  --compare-script starter-duckdb/scripts/compare.py
+```
+
+The benchmark alternates execution order, warms both implementations, creates fresh output directories, and records all runs and phase medians in `results.json`. It reports engine time and launcher wall time separately. Docker wall time includes the CLI/container launch and exit; native timings from another CPU architecture are not scorer predictions. A native binary can be measured with `--engine PATH --baseline-engine PATH` instead of the image options.

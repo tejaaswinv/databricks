@@ -1,8 +1,12 @@
 FROM debian:bookworm-slim AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
-COPY pipeline/engine.cpp /app/engine.cpp
-COPY pipeline/native_parquet.hpp /app/native_parquet.hpp
-RUN g++ -std=c++20 -O3 -march=x86-64 -fopenmp -flto -fno-semantic-interposition -fno-plt -DNDEBUG -I/app -o /app/engine /app/engine.cpp
+RUN apt-get update && apt-get install -y --no-install-recommends g++ libsnappy-dev && rm -rf /var/lib/apt/lists/*
+COPY pipeline /app/pipeline
+RUN g++ -std=c++20 -O3 -fopenmp -flto -fno-semantic-interposition -fno-plt -DNDEBUG -DNATIVEPQ_SNAPPY -o /app/engine /app/pipeline/engine.cpp -Wl,-Bstatic -lsnappy -Wl,-Bdynamic
+
+FROM builder AS tests
+COPY tests /app/tests
+RUN g++ -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer -DNATIVEPQ_SNAPPY -o /app/engine-test /app/tests/engine_test.cpp -Wl,-Bstatic -lsnappy -Wl,-Bdynamic
+CMD ["/app/engine-test"]
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libstdc++6 && rm -rf /var/lib/apt/lists/*

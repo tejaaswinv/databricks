@@ -25,16 +25,12 @@ jobs:
           cargo --version
           cargo build --release --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
-      - name: Inspect public generator hot-path shapes
-        run: |
-          echo '=== generated event sample ==='
-          f=$(find dev/events -name '*.csv' | head -1); head -6 "$f"
-          echo '=== generated click sample ==='
-          f=$(find dev/clicks -name '*.csv' | head -1); head -6 "$f"
-          echo '=== generator source hints ==='
-          grep -R -n -E 'event_id|click_id|ingest_ts|base36|timestamp|duplicate' generator/src | head -100 || true
       - name: Build submission image
         run: docker build --platform linux/amd64 -t shopping-sessions:latest .
+      - name: Differential parser and engine checks under sanitizers
+        run: |
+          docker build --platform linux/amd64 --target tests -t shopping-sessions:tests .
+          docker run --rm --platform linux/amd64 --network none -e OMP_THREAD_LIMIT=2 shopping-sessions:tests
       - name: Install official checker dependency
         run: python3 -m pip install --break-system-packages polars
       - name: Run 36 edge-case fixtures
@@ -45,20 +41,26 @@ jobs:
           mkdir -p out
           IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh dev out
           python3 starter-duckdb/scripts/compare.py out dev-answer
-      - name: A/B benchmark current vs previous optimized commit
+      - name: Paired practice-scale benchmark against the previous main
         run: |
-          generator/target/release/generate --seed 7 --events 5000000 --clicks 1250000 --output bench
-          git worktree add --detach /tmp/baseline 574fd72d038e03100cc84b160ea5f15de70336f2
+          generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output bench
+          git worktree add --detach /tmp/baseline 8d7ff0560673f0ce4c9152b044ee52effb0eaed7
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
-
-          # Warm both images so timing is not dominated by first-read filesystem cache.
-          rm -rf warm-current warm-base && mkdir warm-current warm-base
-          env IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench warm-current >/dev/null
-          env IMAGE=shopping-sessions:baseline CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench warm-base >/dev/null
-
-          rm -rf bench-current bench-base && mkdir bench-current bench-base
-          echo "=== current ==="
-          /usr/bin/time -f 'CURRENT_WALL=%e' env IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench bench-current
-          echo "=== baseline ==="
-          /usr/bin/time -f 'BASELINE_WALL=%e' env IMAGE=shopping-sessions:baseline CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh bench bench-base
-          python3 starter-duckdb/scripts/compare.py bench-current bench-base
+          python3 scripts/benchmark.py --data bench --output benchmark-results \
+            --image shopping-sessions:latest --baseline-image shopping-sessions:baseline \
+            --cpus 4 --memory 7g --runs 5 \
+            --compare-script starter-duckdb/scripts/compare.py
+      - name: Check another generator seed
+        run: |
+          generator/target/release/generate --seed 42 --events 1000000 --clicks 250000 --output seed42
+          IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh seed42 seed42-current
+          IMAGE=shopping-sessions:baseline CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh seed42 seed42-baseline
+          python3 starter-duckdb/scripts/compare.py seed42-current seed42-baseline
+      - name: Save benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-benchmarks
+          path: |
+            benchmark-results/**/results.json
+            benchmark-results/**/stderr.log
