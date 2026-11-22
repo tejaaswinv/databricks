@@ -368,6 +368,12 @@ static string canonical_user_name(uint64_t v){
  char b[16];int at=15;b[at--]=0;static constexpr char d[]="0123456789abcdefghijklmnopqrstuvwxyz";
  do{b[at--]=d[v%36];v/=36;}while(v);b[at]='u';return string(b+at);
 }
+static SV canonical_user_view(uint64_t v){
+ thread_local char b[16];
+ int at=15;static constexpr char d[]="0123456789abcdefghijklmnopqrstuvwxyz";
+ do{b[at--]=d[v%36];v/=36;}while(v);b[at]='u';
+ return SV(b+at,15-at);
+}
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct ClickCand{SV clickid;uint64_t idtag;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
@@ -646,6 +652,9 @@ int main(){
  }
  vector<SV> people;people.reserve(dsu.nodes.size()/2);
  for(size_t i=0;i<min_node.size();i++)if(min_node[i]>=0){rootperson[i]=(int32_t)people.size();people.push_back(dsu.nodes[min_node[i]].value);}
+ // UINT64_MAX => textual name is already backed by input mmap; otherwise
+ // generate canonical u<base36> lazily at Parquet write time.
+ vector<uint64_t> person_numeric_key(people.size(),UINT64_MAX);
  vector<uint32_t> link_person(dsu.nodes.size());
 #ifdef _OPENMP
 #pragma omp parallel for if(dsu.nodes.size()>20000)
@@ -841,10 +850,10 @@ int main(){
   vector<PendingNum>().swap(pending_num_by_part[part]);
  }
  vector<vector<PendingNum>>().swap(pending_num_by_part);
- array<deque<string>,NUM_SHARDS> owned_user_names;
  array<vector<pair<uint64_t,uint32_t>>,NUM_SHARDS> new_numeric;
  uint32_t numeric_base=(uint32_t)people.size();
  people.resize((size_t)numeric_base+pending_num_n);
+ person_numeric_key.resize((size_t)numeric_base+pending_num_n,UINT64_MAX);
  events.resize(good_n+pending_num_n);
  atomic<uint32_t> next_numeric(numeric_base);
 #ifdef _OPENMP
@@ -854,7 +863,7 @@ int main(){
   size_t first=numeric_bounds[sh],last=numeric_bounds[sh+1];
   if(first==last)continue;
   PackedNumPeople local(max<size_t>(16,(last-first)/24));
-  auto& names=owned_user_names[sh];auto& identities=new_numeric[sh];
+  auto& identities=new_numeric[sh];
   for(size_t i=first;i<last;i++){
    const auto& e=numeric_rows[i];
    // All keys in a shard share eight low bits. Remove those bits in the
@@ -863,13 +872,14 @@ int main(){
    uint32_t p=local.find(local_key);
    if(p==UINT32_MAX){
     p=next_numeric.fetch_add(1,memory_order_relaxed);
-    names.push_back(canonical_user_name(e.key));people[p]=names.back();
+    person_numeric_key[p]=e.key;
     local.add(local_key,p);identities.push_back({e.key,p});
    }
    events[good_n+i]={e.t,p,e.price,e.category,e.is_purchase,0};
   }
  }
  people.resize(next_numeric.load(memory_order_relaxed));
+ person_numeric_key.resize(people.size());
  for(const auto& identities:new_numeric)for(const auto& [key,p]:identities)numeric_people.add(key,p);
  vector<PendingNum>().swap(numeric_rows);
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
@@ -881,6 +891,7 @@ int main(){
  for(auto& m:standalone)m.reserve(per_shard);
  uint32_t people_base=(uint32_t)people.size();
  people.resize((size_t)people_base+pending_n);
+ person_numeric_key.resize((size_t)people_base+pending_n,UINT64_MAX);
  atomic<uint32_t> next_person(people_base);
  vector<vector<Evt>> resolved_pending(PARTS);
 #ifdef _OPENMP
@@ -909,6 +920,7 @@ int main(){
  }
  uint32_t final_people=next_person.load(memory_order_relaxed);
  people.resize(final_people);
+ person_numeric_key.resize(final_people);
  // Make the newly assigned IDs available to click processing. This is once per unique
  // ID rather than once per event.
  for(uint32_t p=people_base;p<final_people;p++)person_map.add_link(people[p],p);
@@ -1122,7 +1134,10 @@ int main(){
    size_t first=ud.size()*task/user_parts,last=ud.size()*(task+1)/user_parts;
    string path=out+"/user_daily/part-"+to_string(task)+".parquet";
    nativepq::write_users(path,first,last,
-    [&](size_t i)->SV{return people[ud[i].person];},
+    [&](size_t i)->SV{
+      uint32_t p=ud[i].person;
+      return person_numeric_key[p]==UINT64_MAX?people[p]:canonical_user_view(person_numeric_key[p]);
+    },
     [&](size_t i)->int32_t{return ud[i].day;},
     [&](size_t i)->int64_t{return ud[i].sessions;},
     [&](size_t i)->int64_t{return ud[i].events;},
