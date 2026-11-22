@@ -1,7 +1,7 @@
 name: Validate shopping sessions
 on:
   push:
-    branches: [main, state-optimize]
+    branches: [main, shard-optimize]
   workflow_dispatch:
     inputs:
       baseline_ref:
@@ -52,5 +52,5 @@ jobs:
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
           python3 scripts/benchmark.py --data bench --output benchmark-results \
             --image shopping-sessions:latest --baseline-image shopping-sessions:baseline \
-            --cpus 4 --memory 7g --runs 5 \
+            --cpus 4 --memory 7g --runs 3 \
             --compare-script starter-duckdb/scripts/compare.py
