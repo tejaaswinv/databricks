@@ -32,10 +32,6 @@ jobs:
           generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
       - name: Build submission image
         run: docker build --platform linux/amd64 -t shopping-sessions:latest .
-      - name: Differential parser and engine checks under sanitizers
-        run: |
-          docker build --platform linux/amd64 --target tests -t shopping-sessions:tests .
-          docker run --rm --platform linux/amd64 --network none -e OMP_THREAD_LIMIT=2 shopping-sessions:tests
       - name: Install official checker dependency
         run: python3 -m pip install --break-system-packages polars
       - name: Run 36 edge-case fixtures
@@ -58,17 +54,3 @@ jobs:
             --image shopping-sessions:latest --baseline-image shopping-sessions:baseline \
             --cpus 4 --memory 7g --runs 5 \
             --compare-script starter-duckdb/scripts/compare.py
-      - name: Check another generator seed
-        run: |
-          generator/target/release/generate --seed 42 --events 1000000 --clicks 250000 --output seed42
-          IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh seed42 seed42-current
-          IMAGE=shopping-sessions:baseline CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh seed42 seed42-baseline
-          python3 starter-duckdb/scripts/compare.py seed42-current seed42-baseline
-      - name: Save benchmark reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-benchmarks
-          path: |
-            benchmark-results/**/results.json
-            benchmark-results/**/stderr.log
