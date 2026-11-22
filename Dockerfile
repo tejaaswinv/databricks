@@ -5,7 +5,7 @@ RUN g++ -std=c++20 -O3 -fopenmp -flto -fno-semantic-interposition -fno-plt -DNDE
 
 FROM builder AS tests
 COPY tests /app/tests
-RUN g++ -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer -DNATIVEPQ_SNAPPY -o /app/engine-test /app/tests/engine_test.cpp -Wl,-Bstatic -lsnappy -Wl,-Bdynamic
+RUN g++ -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer -o /app/engine-test /app/tests/engine_test.cpp
 CMD ["/app/engine-test"]
 
 FROM debian:bookworm-slim
