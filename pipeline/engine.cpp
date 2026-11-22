@@ -2,7 +2,6 @@
 #include <array>
 #include <atomic>
 #include <cassert>
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -18,7 +17,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -27,7 +25,6 @@
 #include "native_parquet.hpp"
 #include "csv_reader.hpp"
 #ifdef _OPENMP
-#include <parallel/algorithm>
 #include <omp.h>
 #endif
 using namespace std;
@@ -58,6 +55,8 @@ static bool canonical_base36_id(SV s,char prefix,uint64_t& out){
  }();
  const auto* p=reinterpret_cast<const unsigned char*>(s.data()+1);
  uint64_t v=0;unsigned bad=0;
+ // Pairwise decoding removes the per-character overflow test and the long
+ // multiply dependency chain. Eight base-36 digits need one final range test.
  if(s.size()==9){
   unsigned a=decode[p[0]],b=decode[p[1]],c=decode[p[2]],d=decode[p[3]];
   unsigned e=decode[p[4]],f=decode[p[5]],g=decode[p[6]],h=decode[p[7]];
@@ -71,7 +70,7 @@ static bool canonical_base36_id(SV s,char prefix,uint64_t& out){
  out=v;return true;
 }
 static int64_t dnum(const char* p,int n) {int64_t x=0; for(int i=0;i<n;i++){if(p[i]<'0'||p[i]>'9')return -1; x=x*10+p[i]-'0';} return x;}
-static constexpr int64_t epoch_days(int y,int m,int d){
+static constexpr int64_t epoch_days(int y,int m,int d){ // Howard Hinnant: proleptic Gregorian
  y-=m<=2; int era=(y>=0 ? y:y-399)/400; unsigned yoe=(unsigned)(y-era*400); unsigned doy=(153*(m+(m>2?-3:9))+2)/5+d-1; unsigned yoe_days=yoe*365+yoe/4-yoe/100+doy; return int64_t(era)*146097+yoe_days-719468;
 }
 static constexpr auto year_starts=[] {
@@ -85,10 +84,13 @@ static inline int32_t calendar_day(int y,int m,int d){
  return year_starts[y]+month_starts[m-1]+d-1+(m>2&&leap_year(y));
 }
 static bool parse_time(SV s,int64_t &val,const char* known_date=nullptr,int32_t known_day=0){
+ // F1/F2 are fixed-width. Everything else can only be F3 and is validated in one pass.
  if((s.size()!=20 && s.size()!=25)||s[4]!='-'){
   if(s.empty())return false;
   uint64_t n=0;
   if(s.size()<=18){
+   // Eighteen decimal digits always fit int64_t. Only longer inputs need a
+   // per-digit overflow check (including arbitrarily many leading zeroes).
    for(unsigned char ch:s){if(ch<'0'||ch>'9')return false;n=n*10+(ch-'0');}
    val=(int64_t)n;return true;
   }
@@ -105,8 +107,10 @@ static bool parse_time(SV s,int64_t &val,const char* known_date=nullptr,int32_t 
  int h=dnum(p+11,2),mi=dnum(p+14,2),se=dnum(p+17,2);
  if(h>23||mi>59||se>59||h<0||mi<0||se<0)return false;
  int32_t day;
- if(known_date&&memcmp(p,known_date,10)==0)day=known_day;
- else{
+ if(known_date&&memcmp(p,known_date,10)==0){
+  // ingest_ts is guaranteed valid F1. An identical date is already validated.
+  day=known_day;
+ }else{
   int y=dnum(p,4),m=dnum(p+5,2),d=dnum(p+8,2);
   if(y<1||m<1||m>12||d<1)return false;
   constexpr int md[12]={31,28,31,30,31,30,31,31,30,31,30,31};
@@ -115,17 +119,10 @@ static bool parse_time(SV s,int64_t &val,const char* known_date=nullptr,int32_t 
  }
  int offset=0;
  if(s.size()==25){int oh=dnum(p+20,2),om=dnum(p+23,2);if(oh>23||om>59||oh<0||om<0)return false;offset=oh*60+om;if(p[19]=='-')offset=-offset;}
- val=(day*86400LL+h*3600+mi*60+se-int64_t(offset)*60)*1000;
+ val=(day*86400LL + h*3600+mi*60+se-int64_t(offset)*60)*1000;
  return true;
 }
 static int32_t epoch_day(int64_t ts){int64_t d=ts/DAY; if(ts<0 && ts%DAY)d--;return (int32_t)d;}
-static string date_string(int32_t z) {
- z+=719468; int era=(z>=0?z:z-146096)/146097; unsigned doe=(unsigned)(z-era*146097);
- unsigned yoe=(doe-doe/1460+doe/36524-doe/146096)/365; int y=(int)yoe+era*400;
- unsigned doy=doe-(365*yoe+yoe/4-yoe/100); unsigned mp=(5*doy+2)/153;
- unsigned d=doy-(153*mp+2)/5+1;unsigned m=mp+(mp<10?3:-9);y+=(m<=2);
- char buf[20];snprintf(buf,sizeof(buf),"%04d-%02u-%02u",y,m,d);return string(buf);
-}
 struct Mapping { const char* p=nullptr;size_t n=0; Mapping()=default;
  Mapping(const fs::path& path){int fd=open(path.c_str(),O_RDONLY);if(fd<0){perror("open");exit(2);}struct stat st{};if(fstat(fd,&st)){perror("stat");exit(2);}n=st.st_size;if(n){void* m=mmap(nullptr,n,PROT_READ,MAP_PRIVATE,fd,0);if(m==MAP_FAILED){perror("mmap");exit(2);}p=(char*)m;}close(fd);}
  Mapping(const Mapping&)=delete;Mapping& operator=(const Mapping&)=delete;
@@ -160,27 +157,195 @@ static bool split_csv(SV s,int n,SV *out){
 template<class F>static void foreach_csv(const Mapping&m,int n,F action){
  if(!m.n)return;
  const char *p=m.p,*end=m.p+m.n;
- const char *first=(const char*)memchr(p,'\n',end-p);if(!first)return;p=first+1;
+ const char *first=(const char*)memchr(p,'\n',end-p);if(!first)return;p=first+1; // header
  SV fields[7];
- while(p<end){if(exactcsv::next(p,end,n,fields))action(fields);}
+ while(p<end){
+  if(exactcsv::next(p,end,n,fields))action(fields);
+ }
 }
+static void advise_huge_pages(void* pointer,size_t bytes,bool collapse=false){
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+ if(bytes<(4u<<20))return;
+ long native_page=sysconf(_SC_PAGESIZE);if(native_page<=0)return;
+ size_t page=(size_t)native_page;
+ uintptr_t begin=(uintptr_t)pointer,end=begin+bytes;
+ begin=(begin+page-1)/page*page;end=end/page*page;
+ if(begin>=end)return;
+ madvise((void*)begin,end-begin,MADV_HUGEPAGE);
+#ifdef MADV_COLLAPSE
+ if(collapse)madvise((void*)begin,end-begin,MADV_COLLAPSE);
+#endif
+#endif
+}
+// Canonical 40-bit IDs and small internal indexes share one cache-line-friendly
+// slot. Larger indexes transparently switch to separate full-width values.
+struct PackedNumPeople {
+ static constexpr uint64_t KEY_MASK=(1ULL<<40)-1;
+ vector<uint64_t> slots;
+ vector<uint32_t> wide_values;
+ size_t used=0;
+ explicit PackedNumPeople(size_t expected=16){size_t cap=16;while(cap<expected*10/7+16)cap*=2;slots.resize(cap);}
+ static size_t hash_key(uint64_t key){return (key+1)*0x9E3779B97F4A7C15ULL;}
+ uint64_t key_at(size_t i)const{return wide_values.empty()?(slots[i]&KEY_MASK):slots[i]-1;}
+ uint32_t value_at(size_t i)const{return wide_values.empty()?uint32_t(slots[i]>>40)-1:wide_values[i];}
+ void widen(){
+  wide_values.resize(slots.size());
+  for(size_t i=0;i<slots.size();i++)if(slots[i]){
+   wide_values[i]=uint32_t(slots[i]>>40)-1;slots[i]=(slots[i]&KEY_MASK)+1;
+  }
+ }
+ void set_at(size_t i,uint64_t key,uint32_t value){
+  if(wide_values.empty()&&value>=0xffffffU)widen();
+  if(wide_values.empty())slots[i]=key|(uint64_t(value+1)<<40);
+  else{slots[i]=key+1;wide_values[i]=value;}
+ }
+ void grow(){
+  PackedNumPeople bigger;bigger.slots.assign(slots.size()*2,0);
+  if(!wide_values.empty())bigger.wide_values.resize(bigger.slots.size());
+  for(size_t i=0;i<slots.size();i++)if(slots[i])bigger.add(key_at(i),value_at(i));
+  *this=std::move(bigger);
+ }
+ uint32_t find(uint64_t key)const{
+  size_t p=hash_key(key)&(slots.size()-1);
+  while(slots[p]){if(key_at(p)==key)return value_at(p);p=(p+1)&(slots.size()-1);}
+  return UINT32_MAX;
+ }
+ void add(uint64_t key,uint32_t value){
+  if(used*10>=slots.size()*7)grow();
+  size_t p=hash_key(key)&(slots.size()-1);
+  while(slots[p]){if(key_at(p)==key){set_at(p,key,value);return;}p=(p+1)&(slots.size()-1);}
+  set_at(p,key,value);used++;
+ }
+ void remap(const vector<uint32_t>& values){
+#ifdef _OPENMP
+#pragma omp parallel for if(slots.size()>65536)
+#endif
+  for(size_t i=0;i<slots.size();i++)if(slots[i])set_at(i,key_at(i),values[value_at(i)]);
+ }
+};
+// This cache is scoped to a phase with an immutable identity index. Separate
+// instances after standalone interning prevent stale negative click lookups.
+struct IdentityCache {
+ static constexpr size_t SIZE=2048;
+ array<uint64_t,SIZE> keys{};
+ array<uint32_t,SIZE> values{};
+ uint32_t find(const PackedNumPeople& index,uint64_t key){
+  size_t slot=key&(SIZE-1);uint64_t stored=key+1;
+  if(keys[slot]==stored)return values[slot];
+  uint32_t value=index.find(key);keys[slot]=stored;values[slot]=value;return value;
+ }
+};
 struct Node{int parent,weight;SV value;};
 struct UnionFind{
- vector<Node> nodes;vector<uint32_t> buckets;size_t used=0;
- UnionFind(){buckets.assign(1024,0);}
+ vector<Node> nodes;vector<uint32_t> buckets;vector<uint32_t> special_nodes;size_t used=0;
+ PackedNumPeople numeric;
+ explicit UnionFind(size_t expected):numeric(expected){nodes.reserve(expected);buckets.assign(1024,0);}
  void grow(){
   vector<uint32_t> nb(buckets.size()*2,0);size_t mask=nb.size()-1;
   for(uint32_t v:buckets)if(v){size_t p=Hash{}(nodes[v-1].value)&mask;while(nb[p])p=(p+1)&mask;nb[p]=v;}
   buckets.swap(nb);
  }
  int add(SV s){
+  uint64_t key;
+  if(canonical_base36_id(s,'u',key)){
+   uint32_t found=numeric.find(key);if(found!=UINT32_MAX)return (int)found;
+   int id=(int)nodes.size();nodes.push_back({id,1,s});numeric.add(key,(uint32_t)id);return id;
+  }
   if(used*10>=buckets.size()*7)grow();size_t p=Hash{}(s)&(buckets.size()-1);
   while(buckets[p]){uint32_t v=buckets[p];if(nodes[v-1].value==s)return (int)v-1;p=(p+1)&(buckets.size()-1);}
-  int id=(int)nodes.size();nodes.push_back({id,1,s});buckets[p]=(uint32_t)id+1;used++;return id;
+  int id=(int)nodes.size();nodes.push_back({id,1,s});buckets[p]=(uint32_t)id+1;special_nodes.push_back((uint32_t)id);used++;return id;
  }
  int root(int i){int j=i;while(nodes[j].parent!=j)j=nodes[j].parent;while(nodes[i].parent!=i){int x=nodes[i].parent;nodes[i].parent=j;i=x;}return j;}
  void join(SV a,SV b){int x=root(add(a)),y=root(add(b));if(x==y)return;if(nodes[x].weight<nodes[y].weight)swap(x,y);nodes[y].parent=x;nodes[x].weight+=nodes[y].weight;}
 };
+struct LinkWork{const char* begin;const char* end;};
+static int concurrent_root(vector<Node>& nodes,int i){
+ for(;;){
+  int p=__atomic_load_n(&nodes[i].parent,__ATOMIC_ACQUIRE);
+  if(p==i)return i;
+  int grand=__atomic_load_n(&nodes[p].parent,__ATOMIC_ACQUIRE);
+  __atomic_compare_exchange_n(&nodes[i].parent,&p,grand,true,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+  i=p;
+ }
+}
+static UnionFind build_links(vector<Mapping>& maps,const vector<fs::path>& paths,int ncpu){
+ vector<LinkWork> chunks;size_t raw_nodes=0,bytes=0,first_map=maps.size();
+ for(const auto& path:paths){
+  maps.emplace_back(path);const auto& m=maps.back();bytes+=m.n;
+  if(!m.n)continue;
+  const char* end=m.p+m.n;
+  const char* header=static_cast<const char*>(memchr(m.p,'\n',m.n));
+  if(!header)continue;
+  const char* first=header+1;if(first==end)continue;
+  raw_nodes+=2*(size_t(std::count(first,end,'\n'))+(end[-1]!='\n'));
+  size_t span=end-first,np=max<size_t>(1,(span+262143)/262144);
+  const char* begin=first;
+  for(size_t part=1;part<=np;part++){
+   const char* stop=end;
+   if(part<np){const char* at=first+span*part/np;const char* q=static_cast<const char*>(memchr(at,'\n',end-at));if(q)stop=q+1;}
+   if(begin<stop)chunks.push_back({begin,stop});begin=stop;
+  }
+ }
+ // Reserve enough slots for every raw endpoint before any worker starts.
+ // The serial implementation remains the exact fallback for wider indexes.
+ bool parallel=ncpu>1&&raw_nodes>20000&&raw_nodes<0xfffffeU;
+ UnionFind dsu(max<size_t>(256,parallel?raw_nodes:bytes/16));
+ if(!parallel){
+  for(size_t i=first_map;i<maps.size();i++)foreach_csv(maps[i],2,[&](SV* f){if(!f[0].empty()&&!f[1].empty())dsu.join(f[0],f[1]);});
+  return dsu;
+ }
+ dsu.nodes.resize(raw_nodes);
+ alignas(64) atomic<uint32_t> next_node(0);
+ unordered_map<SV,uint32_t,Hash,Eq> unusual;unusual.reserve(raw_nodes/1000+16);
+ mutex unusual_mutex;
+ auto intern=[&](SV value)->int{
+  uint64_t key;
+  if(canonical_base36_id(value,'u',key)){
+   size_t pos=PackedNumPeople::hash_key(key)&(dsu.numeric.slots.size()-1);
+   for(;;){
+    auto* slot=&dsu.numeric.slots[pos];
+    uint64_t entry=__atomic_load_n(slot,__ATOMIC_ACQUIRE);
+    if(!entry){
+     uint64_t pending=key|(0xffffffULL<<40);
+     if(__atomic_compare_exchange_n(slot,&entry,pending,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+      uint32_t id=next_node.fetch_add(1,memory_order_relaxed);
+      dsu.nodes[id]={(int)id,1,value};
+      __atomic_store_n(slot,key|(uint64_t(id+1)<<40),__ATOMIC_RELEASE);
+      return (int)id;
+     }
+    }
+    if((entry&PackedNumPeople::KEY_MASK)==key){
+     while((entry>>40)==0xffffffULL)entry=__atomic_load_n(slot,__ATOMIC_ACQUIRE);
+     return int(entry>>40)-1;
+    }
+    pos=(pos+1)&(dsu.numeric.slots.size()-1);
+   }
+  }
+  lock_guard<mutex> lock(unusual_mutex);
+  auto it=unusual.find(value);if(it!=unusual.end())return (int)it->second;
+  uint32_t id=next_node.fetch_add(1,memory_order_relaxed);
+  dsu.nodes[id]={(int)id,1,value};unusual.emplace(value,id);return (int)id;
+ };
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t chunk=0;chunk<chunks.size();chunk++){
+  const char* p=chunks[chunk].begin;const char* end=chunks[chunk].end;SV f[2];
+  while(p<end)if(exactcsv::next(p,end,2,f)&&!f[0].empty()&&!f[1].empty()){
+   int x=intern(f[0]),y=intern(f[1]);
+   for(;;){
+    x=concurrent_root(dsu.nodes,x);y=concurrent_root(dsu.nodes,y);
+    if(x==y)break;
+    if(x>y)swap(x,y);
+    int expected=y;
+    if(__atomic_compare_exchange_n(&dsu.nodes[y].parent,&expected,x,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
+   }
+  }
+ }
+ dsu.nodes.resize(next_node.load(memory_order_relaxed));dsu.numeric.used=dsu.nodes.size()-unusual.size();
+ for(const auto& [value,id]:unusual)dsu.special_nodes.push_back(id);
+ return dsu;
+}
 static constexpr uint64_t NONCOMPACT_PAYLOAD=1ULL<<62, NONCANON_ID=1ULL<<63, MASK40=(1ULL<<40)-1;
 struct Cand{uint64_t x0,x1,idtag;}; // 24 bytes: compact generated payload or exact wide fallback
 static inline SV cand_line(const Cand& c){return SV((const char*)(uintptr_t)c.x0,(size_t)(c.x1&0xffffffULL));}
@@ -205,8 +370,7 @@ static string canonical_user_name(uint64_t v){
 }
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
-struct ClickCand{SV clickid,user;uint64_t idtag;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
-struct Assist{uint32_t person;uint32_t t;uint16_t campaign;uint16_t unused=0;};
+struct ClickCand{SV clickid;uint64_t idtag;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
 struct UserDay{uint32_t person;int32_t day;uint32_t sessions=0, events=0;int64_t revenue=0;uint16_t top_category=UINT16_MAX;};
 struct Session{int64_t start;int64_t revenue;uint32_t person;uint32_t userday;uint16_t credited=0;uint8_t purchased=0;uint8_t unused=0;};
 struct Buy{uint32_t userday;uint16_t category;int32_t price;};
@@ -262,105 +426,79 @@ struct FastPeople {
   return id;
  }
 };
-struct FlatNumPeople{
- vector<uint64_t> keys;vector<uint32_t> vals;size_t used=0;
- explicit FlatNumPeople(size_t expected=16){size_t cap=16;while(cap<expected*2)cap<<=1;keys.assign(cap,0);vals.resize(cap);}
- static size_t h(uint64_t x){return (size_t)(x*0x9E3779B97F4A7C15ULL);}
- void grow(){
-  vector<uint64_t> nk(keys.size()*2,0);vector<uint32_t> nv(nk.size());size_t mask=nk.size()-1;
-  for(size_t i=0;i<keys.size();i++)if(keys[i]){
-   size_t p=h(keys[i])&mask;while(nk[p])p=(p+1)&mask;nk[p]=keys[i];nv[p]=vals[i];
-  }
-  keys.swap(nk);vals.swap(nv);
- }
- uint32_t find(uint64_t key)const{
-  uint64_t stored=key+1;size_t p=h(stored)&(keys.size()-1);
-  while(keys[p]){if(keys[p]==stored)return vals[p];p=(p+1)&(keys.size()-1);}return UINT32_MAX;
- }
- void add(uint64_t key,uint32_t person){
-  if(used*10>=keys.size()*7)grow();uint64_t stored=key+1;size_t p=h(stored)&(keys.size()-1);
-  while(keys[p]){if(keys[p]==stored){vals[p]=person;return;}p=(p+1)&(keys.size()-1);}
-  keys[p]=stored;vals[p]=person;used++;
- }
-};
-static inline uint64_t cand_event_key(const Cand& c){return c.idtag&~(NONCOMPACT_PAYLOAD|NONCANON_ID);}
-static void radix_cands(vector<Cand>& a){
- if(a.size()<2)return;
- vector<Cand> tmp(a.size());
- vector<uint32_t> cnt(1u<<16);
- for(unsigned pass=0;pass<3;pass++){
-  fill(cnt.begin(),cnt.end(),0);
-  unsigned shift=pass*16;
-  for(const Cand& c:a)cnt[(cand_event_key(c)>>shift)&0xffffu]++;
-  uint32_t sum=0;for(size_t i=0;i<cnt.size();i++){uint32_t n=cnt[i];cnt[i]=sum;sum+=n;}
-  for(const Cand& c:a)tmp[cnt[(cand_event_key(c)>>shift)&0xffffu]++]=c;
-  a.swap(tmp);
- }
-}
 struct FlatEventIndex {
- vector<uint32_t> buckets;
- size_t used = 0;
- vector<Cand>& rows;
- explicit FlatEventIndex(vector<Cand>& v,size_t expected):rows(v) {
-   size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
-   buckets.assign(cap,0);
- }
- uint32_t get_or_create(const Cand& c) {
-   if(used*10>=buckets.size()*7)grow();
-   size_t mask=buckets.size()-1;
-   uint64_t ckey=c.idtag&~NONCOMPACT_PAYLOAD;
-   size_t p=(size_t)ckey&mask;
-   for(;;) {
-     uint32_t v=buckets[p];
-     if(!v) {
-       uint32_t id=(uint32_t)rows.size();
-       buckets[p]=id+1;used++;
-       return UINT32_MAX;
-     }
-     const Cand& old=rows[v-1];uint64_t okey=old.idtag&~NONCOMPACT_PAYLOAD;
-     if(ckey==okey){
-      if((ckey&NONCANON_ID)==0 || cand_eventid(c)==cand_eventid(old))return v-1;
-     }
-     p=(p+1)&mask;
-   }
- }
- void grow() {
-   vector<uint32_t> nb(buckets.size()*2,0);
-   size_t mask=nb.size()-1;
-   for(uint32_t v:buckets) if(v) {
-     size_t p=(size_t)(rows[v-1].idtag&~NONCOMPACT_PAYLOAD)&mask;
-     while(nb[p])p=(p+1)&mask;
-     nb[p]=v;
-   }
-   buckets.swap(nb);
- }
-};
-struct FlatClickSet {
- vector<uint32_t> buckets;
- vector<Click> &rows;
+ vector<uint64_t> packed;
+ vector<uint32_t> wide;
  size_t used=0;
- explicit FlatClickSet(vector<Click>& r,size_t expected):rows(r){size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);}
- void grow(){vector<uint32_t> nb(buckets.size()*2);size_t mask=nb.size()-1;
-  for(uint32_t v:buckets)if(v){size_t p=Hash{}(rows[v-1].clickid)&mask;while(nb[p])p=(p+1)&mask;nb[p]=v;}
-  buckets.swap(nb);
+ vector<Cand>& rows;
+ unsigned partition_bits;
+ explicit FlatEventIndex(vector<Cand>& v,size_t expected,unsigned bits,bool force_wide=false):rows(v),partition_bits(bits){
+  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
+  if(expected<0xffffffU&&!force_wide)packed.resize(cap);else wide.resize(cap);
  }
- bool insert(SV k){if(used*10>=buckets.size()*7)grow();size_t p=Hash{}(k)&(buckets.size()-1);
-  while(buckets[p]){if(rows[buckets[p]-1].clickid==k)return false;p=(p+1)&(buckets.size()-1);}
-  buckets[p]=(uint32_t)rows.size()+1;used++;return true;
+ void widen(){
+  wide.resize(packed.size());
+  for(size_t i=0;i<packed.size();i++)wide[i]=uint32_t(packed[i]>>40);
+  vector<uint64_t>().swap(packed);
+ }
+ uint32_t get_or_create(const Cand& c){
+  if(!packed.empty()&&rows.size()>=0xffffffU)widen();
+  size_t capacity=packed.empty()?wide.size():packed.size();
+  if(used*10>=capacity*7){grow();capacity=packed.empty()?wide.size():packed.size();}
+  uint64_t key=c.idtag&~NONCOMPACT_PAYLOAD;size_t mask=capacity-1,p=(size_t)(key>>partition_bits)&mask;
+  if(!packed.empty()){
+   for(;;){
+    uint64_t slot=packed[p];
+    if(!slot){packed[p]=(uint64_t(rows.size()+1)<<40)|(key&MASK40);used++;return UINT32_MAX;}
+    // Keep the key beside the row index. Ordinary hash collisions no longer
+    // fetch a random candidate cache line just to inspect its event ID.
+    if((slot&MASK40)==(key&MASK40)){
+     uint32_t at=uint32_t(slot>>40)-1;const auto& old=rows[at];
+     if(key==(old.idtag&~NONCOMPACT_PAYLOAD)&&((key&NONCANON_ID)==0||cand_eventid(c)==cand_eventid(old)))return at;
+    }
+    p=(p+1)&mask;
+   }
+  }
+  for(;;){
+   uint32_t value=wide[p];
+   if(!value){wide[p]=(uint32_t)rows.size()+1;used++;return UINT32_MAX;}
+   const auto& old=rows[value-1];
+   if(key==(old.idtag&~NONCOMPACT_PAYLOAD)&&((key&NONCANON_ID)==0||cand_eventid(c)==cand_eventid(old)))return value-1;
+   p=(p+1)&mask;
+  }
+ }
+ void grow(){
+  if(!packed.empty()){
+   vector<uint64_t> bigger(packed.size()*2);size_t mask=bigger.size()-1;
+   for(uint64_t slot:packed)if(slot){
+    uint32_t at=uint32_t(slot>>40)-1;size_t p=(size_t)((rows[at].idtag&~NONCOMPACT_PAYLOAD)>>partition_bits)&mask;
+    while(bigger[p])p=(p+1)&mask;bigger[p]=slot;
+   }
+   packed.swap(bigger);
+  }else{
+   vector<uint32_t> bigger(wide.size()*2);size_t mask=bigger.size()-1;
+   for(uint32_t value:wide)if(value){
+    size_t p=(size_t)((rows[value-1].idtag&~NONCOMPACT_PAYLOAD)>>partition_bits)&mask;
+    while(bigger[p])p=(p+1)&mask;bigger[p]=value;
+   }
+   wide.swap(bigger);
+  }
  }
 };
 struct FlatClickCandIndex {
  vector<uint32_t> buckets;
- vector<ClickCand>& rows;
- explicit FlatClickCandIndex(vector<ClickCand>& r,size_t expected):rows(r){
+ vector<Click>& rows;
+ vector<uint64_t>& tags;
+ unsigned partition_bits;
+ FlatClickCandIndex(vector<Click>& r,vector<uint64_t>& k,size_t expected,unsigned bits):rows(r),tags(k),partition_bits(bits){
   size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);
  }
  bool insert(const ClickCand& c){
-  size_t p=(size_t)c.idtag&(buckets.size()-1);
+  size_t p=(size_t)(c.idtag>>partition_bits)&(buckets.size()-1);
   while(buckets[p]){
-   const ClickCand& old=rows[buckets[p]-1];
-   if(c.idtag==old.idtag){
-    if((c.idtag>>63)==0 || c.clickid==old.clickid)return false;
+   size_t at=buckets[p]-1;
+   if(c.idtag==tags[at]){
+    if((c.idtag>>63)==0 || c.clickid==rows[at].clickid)return false;
    }
    p=(p+1)&(buckets.size()-1);
   }
@@ -369,6 +507,7 @@ struct FlatClickCandIndex {
  }
 };
 static int64_t parse_ingest(SV s,int32_t& day){
+ // rules.md guarantees ingest_ts is valid F1; avoid the generic validator on every raw event.
  const char* p=s.data();
  int y=(p[0]-'0')*1000+(p[1]-'0')*100+(p[2]-'0')*10+(p[3]-'0');
  int mo=(p[5]-'0')*10+(p[6]-'0'), d=(p[8]-'0')*10+(p[9]-'0');
@@ -383,65 +522,71 @@ static int32_t parse_price(SV s) {
  return v>0?v:-1;
 }
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
-struct FastOut{
- FILE* f=nullptr;vector<char> buf;size_t at=0;
- explicit FastOut(const string& path):buf(1<<20){f=fopen(path.c_str(),"wb");if(!f){perror("fopen");exit(2);}}
- ~FastOut(){flush();if(f)fclose(f);}
- void flush(){if(at){fwrite(buf.data(),1,at,f);at=0;}}
- void raw(const char* p,size_t n){if(n>buf.size()){flush();fwrite(p,1,n,f);return;}if(at+n>buf.size())flush();memcpy(buf.data()+at,p,n);at+=n;}
- void str(SV v){raw(v.data(),v.size());}
- void ch(char c){if(at==buf.size())flush();buf[at++]=c;}
- template<class T> void num(T v){char x[32];auto r=to_chars(x,x+sizeof(x),v);raw(x,(size_t)(r.ptr-x));}
- void field(SV v){if(v.find('\r')==SV::npos){str(v);return;}ch('"');str(v);ch('"');}
- void date(int32_t z){
-  z+=719468;int era=(z>=0?z:z-146096)/146097;unsigned doe=(unsigned)(z-era*146097);
-  unsigned yoe=(doe-doe/1460+doe/36524-doe/146096)/365;int y=(int)yoe+era*400;
-  unsigned doy=doe-(365*yoe+yoe/4-yoe/100);unsigned mp=(5*doy+2)/153;
-  unsigned d=doy-(153*mp+2)/5+1,m=mp+(mp<10?3:-9);y+=(m<=2);
-  char x[10];x[0]='0'+(y/1000)%10;x[1]='0'+(y/100)%10;x[2]='0'+(y/10)%10;x[3]='0'+y%10;x[4]='-';
-  x[5]='0'+m/10;x[6]='0'+m%10;x[7]='-';x[8]='0'+d/10;x[9]='0'+d%10;raw(x,10);
- }
-};
-template<class T,class Time>
-static vector<size_t> bucket_person_time(vector<T>& a,size_t person_count,Time time_key){
- vector<size_t> off(person_count+1,0);
- for(const T& x:a)off[(size_t)x.person+1]++;
- for(size_t i=1;i<off.size();i++)off[i]+=off[i-1];
- if(a.size()>1){
-  vector<size_t> pos=off;
-  vector<T> tmp(a.size());
-  for(const T& x:a)tmp[pos[x.person]++]=x;
-  a.swap(tmp);
+template<class T,class Key>
+static void radix64(vector<T>& a, Key key, int passes=4){
+ if(a.size()<2)return;
+ constexpr size_t R=1u<<16, MASK=R-1;
+ int nt=1;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+ nt=max(1,omp_get_max_threads());
 #endif
-  for(size_t p=0;p<person_count;p++){
-   size_t lo=off[p],hi=off[p+1],n=hi-lo;
-   if(n<2)continue;
-   T* q=a.data()+lo;
-   if(n<=16){
-    for(size_t i=1;i<n;i++){
-     T v=q[i];size_t j=i;
-     while(j&&time_key(v)<time_key(q[j-1])){q[j]=q[j-1];--j;}
-     q[j]=v;
-    }
-   }else sort(q,q+n,[&](const T&x,const T&y){return time_key(x)<time_key(y);});
+ if(a.size()<32768){sort(a.begin(),a.end(),[&](const T& x,const T& y){return key(x)<key(y);});return;}
+ vector<T> tmp(a.size());
+ vector<size_t> hist((size_t)nt*R), pos((size_t)nt*R);
+ for(int pass=0;pass<passes;pass++){
+  fill(hist.begin(),hist.end(),0);
+  unsigned shift=pass*16;
+  int active=nt;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+   int tid=0;
+#ifdef _OPENMP
+   tid=omp_get_thread_num();
+#pragma omp single
+   active=omp_get_num_threads();
+#endif
+   size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
+   size_t* h=hist.data()+(size_t)tid*R;
+   for(size_t i=lo;i<hi;i++)h[(key(a[i])>>shift)&MASK]++;
   }
+  size_t base=0;
+  for(size_t b=0;b<R;b++){
+   size_t total=0;
+   for(int t=0;t<active;t++)total+=hist[(size_t)t*R+b];
+   size_t p=base;
+   for(int t=0;t<active;t++){pos[(size_t)t*R+b]=p;p+=hist[(size_t)t*R+b];}
+   base+=total;
+  }
+#ifdef _OPENMP
+#pragma omp parallel num_threads(active)
+#endif
+  {
+   int tid=0;
+#ifdef _OPENMP
+   tid=omp_get_thread_num();
+#endif
+   size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
+   size_t* p=pos.data()+(size_t)tid*R;
+   for(size_t i=lo;i<hi;i++){size_t b=(key(a[i])>>shift)&MASK;tmp[p[b]++]=a[i];}
+  }
+  a.swap(tmp);
  }
- return off;
 }
-static vector<size_t> order_events(vector<Evt>& es,size_t people){
- return bucket_person_time(es,people,[](const Evt&e){return e.t;});
+static void order_events(vector<Evt>& es){
+ radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
-static vector<size_t> order_clicks(vector<Click>& cs,size_t people){
- return bucket_person_time(cs,people,[](const Click&c){return c.t;});
+static void order_clicks(vector<Click>& cs){
+ radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
  const string out=getenv("OUTPUT_DIR")?getenv("OUTPUT_DIR"):"/output";
- int ncpu=getenv("NCPU")?atoi(getenv("NCPU")):8;
+ int ncpu=max(1,getenv("NCPU")?atoi(getenv("NCPU")):8);
 #ifdef _OPENMP
- omp_set_num_threads(max(1,ncpu));
+ omp_set_dynamic(0);
+ omp_set_num_threads(ncpu);
 #endif
  auto t0=chrono::steady_clock::now();
  auto mark=t0;
@@ -483,34 +628,36 @@ int main(){
   auto it=campaign_ids.find(x);return it==campaign_ids.end()?UINT16_MAX:it->second;
  };
  uint16_t organic=campaigns.size();campaigns.push_back("organic");channels.push_back("organic");
- UnionFind dsu;
- for(auto&p:input_files(data+"/links")){maps.emplace_back(p);foreach_csv(maps.back(),2,[&](SV*f){if(!f[0].empty()&&!f[1].empty())dsu.join(f[0],f[1]);});}
- vector<int32_t> rootperson(dsu.nodes.size(),-1);
- vector<SV> min_name(dsu.nodes.size());
- for(int i=0;i<(int)dsu.nodes.size();i++){int r=dsu.root(i);SV nm=dsu.nodes[i].value;if(min_name[r].empty()||byte_less(nm,min_name[r]))min_name[r]=nm;}
- vector<SV> people;
- vector<uint32_t> link_person(dsu.nodes.size());
- for(int i=0;i<(int)dsu.nodes.size();i++){int r=dsu.root(i);if(rootperson[r]<0){rootperson[r]=people.size();people.push_back(min_name[r]);}link_person[i]=rootperson[r];}
- FastPeople person_map(people,max<size_t>(2048,dsu.nodes.size()/32+128));
- FlatNumPeople numeric_people(dsu.nodes.size()+4096);
- for(size_t i=0;i<dsu.nodes.size();++i){
-  uint64_t uk;
-  if(canonical_base36_id(dsu.nodes[i].value,'u',uk))numeric_people.add(uk,link_person[i]);
-  else person_map.add_link(dsu.nodes[i].value,link_person[i]);
- }
- dsu.buckets.clear();dsu.buckets.shrink_to_fit();
- auto person_find=[&](SV name)->uint32_t{
-  uint64_t uk;if(canonical_base36_id(name,'u',uk))return numeric_people.find(uk);
-  return person_map.find_only(name);
- };
- auto person_for=[&](SV name)->uint32_t{
-  uint64_t uk;
-  if(canonical_base36_id(name,'u',uk)){
-   uint32_t p=numeric_people.find(uk);if(p!=UINT32_MAX)return p;
-   p=(uint32_t)people.size();people.push_back(name);numeric_people.add(uk,p);return p;
+ auto link_paths=input_files(data+"/links");
+ auto links_start=chrono::steady_clock::now();
+ UnionFind dsu=build_links(maps,link_paths,ncpu);
+ auto links_built=chrono::steady_clock::now();
+ vector<int32_t> rootperson(dsu.nodes.size(),-1),min_node(dsu.nodes.size(),-1);
+ vector<uint32_t> roots(dsu.nodes.size());
+#ifdef _OPENMP
+#pragma omp parallel for if(dsu.nodes.size()>20000)
+#endif
+ for(size_t i=0;i<dsu.nodes.size();i++){
+  int r=concurrent_root(dsu.nodes,(int)i);roots[i]=(uint32_t)r;
+  int32_t previous=__atomic_load_n(&min_node[r],__ATOMIC_ACQUIRE);
+  while(previous<0||byte_less(dsu.nodes[i].value,dsu.nodes[previous].value)){
+   if(__atomic_compare_exchange_n(&min_node[r],&previous,(int32_t)i,true,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
   }
-  return person_map.get(name);
- };
+ }
+ vector<SV> people;people.reserve(dsu.nodes.size()/2);
+ for(size_t i=0;i<min_node.size();i++)if(min_node[i]>=0){rootperson[i]=(int32_t)people.size();people.push_back(dsu.nodes[min_node[i]].value);}
+ vector<uint32_t> link_person(dsu.nodes.size());
+#ifdef _OPENMP
+#pragma omp parallel for if(dsu.nodes.size()>20000)
+#endif
+ for(size_t i=0;i<dsu.nodes.size();i++)link_person[i]=(uint32_t)rootperson[roots[i]];
+ FastPeople person_map(people,max<size_t>(2048,dsu.nodes.size()/32+128));
+ PackedNumPeople numeric_people=std::move(dsu.numeric);
+ numeric_people.remap(link_person);
+ advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),true);
+ for(uint32_t i:dsu.special_nodes)person_map.add_link(dsu.nodes[i].value,link_person[i]);
+ dsu.buckets.clear();dsu.buckets.shrink_to_fit();
+ cerr<<"subphase link_build="<<chrono::duration<double>(links_built-links_start).count()<<"s canonicalize="<<chrono::duration<double>(chrono::steady_clock::now()-links_built).count()<<"s\n";
  cerr<<"links nodes="<<dsu.nodes.size()<<"\n";lap("links_dims");
  // Event dedup happens before *all* event validation.
  // Batch parse in parallel, then independently deduplicate by exact event ID.
@@ -535,7 +682,7 @@ int main(){
   const char* first=header+1;
   if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(32,(span+4194303)/4194304));
+  size_t np=max<size_t>(1,min<size_t>(128,(span+262143)/262144));
   vector<const char*> bounds(np+1);
   bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){
@@ -545,7 +692,7 @@ int main(){
   }
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])chunks.push_back({bounds[j],bounds[j+1]});
  }
- constexpr size_t PARTS=16;
+ constexpr size_t PARTS=256;
  const size_t workers=max(1,ncpu);
  vector<vector<Cand>> raw(workers*PARTS);
  for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
@@ -560,10 +707,10 @@ int main(){
   const char* p=chunks[ch].begin;const char* end=chunks[ch].end;
   SV f[7];
   while(p<end){
-   const char* row_start=p;
+   const char* first=p;
    if(exactcsv::events(p,end,7,f)&&!f[0].empty()){
-     const char* row_end=(p==end&&p[-1]!='\n')?end:p-1;
-     SV line(row_start,(size_t)(row_end-row_start));
+     const char* last=p==end&&p[-1]!='\n'?end:p-1;
+     SV line(first,last-first);
      uint64_t n=0,tag,uk=0,x0,x1;int32_t ingest_day;int64_t ingest=parse_ingest(f[3],ingest_day);
      bool event_canon=canonical_base36_id(f[0],'e',n);
      bool compact=event_canon && canonical_base36_id(f[1],'u',uk);
@@ -596,51 +743,7 @@ int main(){
   }
  }
  lap("event_parse");
- vector<vector<Cand>> unique(PARTS);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
-  vector<Cand> canonical,fallback;
-  canonical.reserve(n*7/8+32);fallback.reserve(n/8+32);
-  for(size_t t=0;t<workers;t++){
-   auto& rows=raw[t*PARTS+part];
-   for(const Cand& c:rows){
-    if((c.idtag&NONCANON_ID)==0)canonical.push_back(c);
-    else fallback.push_back(c);
-   }
-   vector<Cand>().swap(rows);
-  }
-
-  radix_cands(canonical);
-  vector<Cand> winners;winners.reserve(canonical.size()+fallback.size());
-  for(size_t i=0;i<canonical.size();){
-   size_t j=i+1;size_t best=i;uint64_t key=cand_event_key(canonical[i]);
-   while(j<canonical.size()&&cand_event_key(canonical[j])==key){
-    if(cand_ingest_ms(canonical[j],ws)<cand_ingest_ms(canonical[best],ws))best=j;
-    j++;
-   }
-   winners.push_back(canonical[best]);i=j;
-  }
-  vector<Cand>().swap(canonical);
-
-  if(!fallback.empty()){
-   vector<Cand> fb;fb.reserve(fallback.size());
-   FlatEventIndex idx(fb,fallback.size());
-   for(const Cand& c:fallback){
-    uint32_t ix=idx.get_or_create(c);
-    if(ix==UINT32_MAX)fb.push_back(c);
-    else if(cand_ingest_ms(c,ws)<cand_ingest_ms(fb[ix],ws))fb[ix]=c;
-   }
-   winners.insert(winners.end(),fb.begin(),fb.end());
-  }
-  vector<Cand>().swap(fallback);
-  unique[part]=move(winners);
- }
- vector<vector<Cand>>().swap(raw);lap("event_dedup");
- // Validate winners in parallel. The linked-ID table is immutable here, so its lookups
- // are thread-safe. Only IDs absent from links are deferred for sequential insertion.
+ vector<IdentityCache> event_people_cache(workers);
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
  vector<vector<PendingNum>> pending_num_by_part(PARTS);
@@ -649,7 +752,24 @@ int main(){
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<PARTS;part++){
-  auto& rows=unique[part];
+  size_t lookup_tid=0;
+#ifdef _OPENMP
+  lookup_tid=(size_t)omp_get_thread_num();
+#endif
+  auto& cache=event_people_cache[lookup_tid];
+  size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
+  vector<Cand> cands;cands.reserve(n);
+  FlatEventIndex idx(cands,n,countr_zero(PARTS));
+  for(size_t t=0;t<workers;t++){
+   auto& rows=raw[t*PARTS+part];
+   for(const Cand& c:rows){
+      uint32_t ix=idx.get_or_create(c);
+      if(ix==UINT32_MAX)cands.push_back(c);
+      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
+   }
+   vector<Cand>().swap(rows);
+  }
+  auto& rows=cands;
   auto& good=valid_by_part[part];
   auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
   good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
@@ -675,32 +795,83 @@ int main(){
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
    }
-   uint32_t p=(uk!=UINT64_MAX)?numeric_people.find(uk):person_map.find_hashed(user,user_hash);
+   uint32_t p=(uk!=UINT64_MAX)?cache.find(numeric_people,uk):person_map.find_hashed(user,user_hash);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
  }
- vector<vector<Cand>>().swap(unique);
+ vector<vector<Cand>>().swap(raw);
+ lap("event_dedup_validate");
  auto validate_t1=chrono::steady_clock::now();
  size_t good_n=0,pending_n=0,pending_num_n=0;
  for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();pending_num_n+=pending_num_by_part[part].size();}
  vector<Evt> events;events.reserve(good_n+pending_n+pending_num_n);
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
- deque<string> owned_user_names;
- for(auto&src:pending_num_by_part){
-  for(const PendingNum&e:src){
-   uint32_t p=numeric_people.find(e.key);
-   if(p==UINT32_MAX){
-    p=(uint32_t)people.size();owned_user_names.push_back(canonical_user_name(e.key));people.push_back(owned_user_names.back());numeric_people.add(e.key,p);
-   }
-   events.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
+ // Partition unresolved numeric identities once, then intern each shard without
+ // locks. Repeated events no longer revisit one large mutable identity table.
+ constexpr size_t NUM_SHARDS=256;
+ vector<size_t> numeric_counts(PARTS*NUM_SHARDS),numeric_offsets(PARTS*NUM_SHARDS);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+ for(size_t part=0;part<PARTS;part++){
+  auto* counts=numeric_counts.data()+part*NUM_SHARDS;
+  for(const auto& e:pending_num_by_part[part])counts[e.key&(NUM_SHARDS-1)]++;
+ }
+ array<size_t,NUM_SHARDS+1> numeric_bounds{};
+ size_t numeric_at=0;
+ for(size_t sh=0;sh<NUM_SHARDS;sh++){
+  numeric_bounds[sh]=numeric_at;
+  for(size_t part=0;part<PARTS;part++){
+   numeric_offsets[part*NUM_SHARDS+sh]=numeric_at;
+   numeric_at+=numeric_counts[part*NUM_SHARDS+sh];
   }
-  vector<PendingNum>().swap(src);
+ }
+ numeric_bounds[NUM_SHARDS]=numeric_at;
+ vector<PendingNum> numeric_rows(pending_num_n);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+ for(size_t part=0;part<PARTS;part++){
+  auto* positions=numeric_offsets.data()+part*NUM_SHARDS;
+  for(const auto& e:pending_num_by_part[part])numeric_rows[positions[e.key&(NUM_SHARDS-1)]++]=e;
+  vector<PendingNum>().swap(pending_num_by_part[part]);
  }
  vector<vector<PendingNum>>().swap(pending_num_by_part);
+ array<deque<string>,NUM_SHARDS> owned_user_names;
+ array<vector<pair<uint64_t,uint32_t>>,NUM_SHARDS> new_numeric;
+ uint32_t numeric_base=(uint32_t)people.size();
+ people.resize((size_t)numeric_base+pending_num_n);
+ events.resize(good_n+pending_num_n);
+ atomic<uint32_t> next_numeric(numeric_base);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t sh=0;sh<NUM_SHARDS;sh++){
+  size_t first=numeric_bounds[sh],last=numeric_bounds[sh+1];
+  if(first==last)continue;
+  PackedNumPeople local(max<size_t>(16,(last-first)/24));
+  auto& names=owned_user_names[sh];auto& identities=new_numeric[sh];
+  for(size_t i=first;i<last;i++){
+   const auto& e=numeric_rows[i];
+   // All keys in a shard share eight low bits. Remove those bits in the
+   // private table too, while retaining the complete ID in the global index.
+   uint64_t local_key=e.key/NUM_SHARDS;
+   uint32_t p=local.find(local_key);
+   if(p==UINT32_MAX){
+    p=next_numeric.fetch_add(1,memory_order_relaxed);
+    names.push_back(canonical_user_name(e.key));people[p]=names.back();
+    local.add(local_key,p);identities.push_back({e.key,p});
+   }
+   events[good_n+i]={e.t,p,e.price,e.category,e.is_purchase,0};
+  }
+ }
+ people.resize(next_numeric.load(memory_order_relaxed));
+ for(const auto& identities:new_numeric)for(const auto& [key,p]:identities)numeric_people.add(key,p);
+ vector<PendingNum>().swap(numeric_rows);
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
  // so assignment order is irrelevant; every equal byte string still gets exactly one person.
  constexpr size_t ID_SHARDS=256;
@@ -746,7 +917,7 @@ int main(){
  vector<vector<PendingEvt>>().swap(pending_by_part);
  auto validate_t2=chrono::steady_clock::now();
  cerr<<"subphase winner_validate="<<chrono::duration<double>(validate_t1-validate_t0).count()<<"s standalone_resolve="<<chrono::duration<double>(validate_t2-validate_t1).count()<<"s\n";
- cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<(pending_n+pending_num_n)<<"\n";lap("event_validate");
+ cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<(pending_n+pending_num_n)<<"\n";lap("identity_resolve");
  // Clicks: parse + validate in parallel, then exact-dedup independent ID shards.
  auto click_paths=input_files(data+"/clicks");
  vector<Work> click_chunks;
@@ -757,13 +928,14 @@ int main(){
   const char* header=(const char*)memchr(m.p,'\n',m.n);if(!header)continue;
   const char* first=header+1;if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(32,(span+2097151)/2097152));
+  size_t np=max<size_t>(1,min<size_t>(64,(span+262143)/262144));
   vector<const char*> bounds(np+1);bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){const char* p=first+span*j/np;const char* q=(const char*)memchr(p,'\n',end-p);bounds[j]=q?q+1:end;}
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])click_chunks.push_back({bounds[j],bounds[j+1]});
  }
  constexpr size_t CPARTS=16;
  size_t click_est=max<size_t>(1000,events.size()/4);
+ vector<IdentityCache> click_people_cache(workers);
  vector<vector<ClickCand>> click_raw(workers*CPARTS);
  for(auto&v:click_raw)v.reserve(click_est/workers/CPARTS+16);
 #ifdef _OPENMP
@@ -785,159 +957,197 @@ int main(){
       if(canonical_base36_id(f[0],'k',n))tag=n;
       else tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
       uint64_t uk;uint32_t person;
-      if(canonical_base36_id(f[1],'u',uk))person=numeric_people.find(uk);
+      if(canonical_base36_id(f[1],'u',uk))person=click_people_cache[tid].find(numeric_people,uk);
       else {size_t uh=Hash{}(f[1]);person=person_map.find_hashed(f[1],uh);}
-      click_raw[tid*CPARTS+((size_t)tag%CPARTS)].push_back({f[0],f[1],tag,(uint32_t)(ts-(ws-WEEK)),person,cid,0});
+      // A click for a person with no surviving event can affect neither table.
+      // Dropping it also avoids interning identities that can never have a session.
+      if(person==UINT32_MAX)continue;
+      click_raw[tid*CPARTS+((size_t)tag%CPARTS)].push_back({f[0],tag,(uint32_t)(ts-(ws-WEEK)),person,cid,0});
      }
     }
    }
   }
  }
- vector<vector<ClickCand>> click_unique(CPARTS);
+ vector<vector<Click>> click_unique(CPARTS);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<CPARTS;part++){
   size_t n=0;for(size_t t=0;t<workers;t++)n+=click_raw[t*CPARTS+part].size();
-  vector<ClickCand> rows;rows.reserve(n);FlatClickCandIndex idx(rows,n);
+  vector<Click> rows;rows.reserve(n);vector<uint64_t> tags;tags.reserve(n);
+  FlatClickCandIndex idx(rows,tags,n,countr_zero(CPARTS));
   for(size_t t=0;t<workers;t++){
    auto& src=click_raw[t*CPARTS+part];
-   for(const ClickCand& c:src)if(idx.insert(c))rows.push_back(c);
+   for(const ClickCand& c:src)if(idx.insert(c)){
+    rows.push_back({c.clickid,c.t,c.person,c.campaign,0});tags.push_back(c.idtag);
+   }
    vector<ClickCand>().swap(src);
   }
-  click_unique[part]=move(rows);
+  click_unique[part]=std::move(rows);
  }
  vector<vector<ClickCand>>().swap(click_raw);
- size_t click_n=0;for(auto&v:click_unique)click_n+=v.size();
- vector<Click> clicks;clicks.reserve(click_n);
- for(auto&v:click_unique){
-  for(const ClickCand& c:v){
-   uint32_t p=c.person==UINT32_MAX?person_for(c.user):c.person;
-   clicks.push_back({c.clickid,c.t,p,c.campaign,0});
-  }
-  vector<ClickCand>().swap(v);
+ array<size_t,CPARTS+1> click_bounds{};
+ for(size_t part=0;part<CPARTS;part++)click_bounds[part+1]=click_bounds[part]+click_unique[part].size();
+ vector<Click> clicks(click_bounds.back());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+ for(size_t part=0;part<CPARTS;part++){
+  auto& rows=click_unique[part];
+  std::copy(rows.begin(),rows.end(),clicks.begin()+click_bounds[part]);
+  vector<Click>().swap(rows);
  }
- vector<vector<ClickCand>>().swap(click_unique);
+ vector<vector<Click>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
- // Dense person bucketing replaces global sorting. Each person's tiny time slice is
- // independently ordered, then sessionization + attribution + assists are fused per person.
- auto event_off=order_events(events,people.size());lap("event_bucket_sort");
- auto click_off=order_clicks(clicks,people.size());lap("click_bucket_sort");
- const int nt=max(1,ncpu);
- const size_t camp_cells=(size_t)campaigns.size()*nday;
- vector<vector<UserDay>> ud_tls(nt);
- vector<vector<CampDay>> camp_tls(nt,vector<CampDay>(camp_cells));
- for(auto&v:ud_tls)v.reserve(max<size_t>(64,people.size()*2/(size_t)nt));
+ // Sessions from globally sorted valid events, across every linked ID.
+ order_events(events);lap("event_sort");
+ // Count output ranges first so independent groups of whole people can write
+ // directly into final arrays. No locks or concatenation of session copies.
+ size_t session_parts=min<size_t>(workers*4,max<size_t>(1,events.size()/65536));
+ vector<size_t> event_bounds(session_parts+1);event_bounds.back()=events.size();
+ for(size_t part=1;part<session_parts;part++){
+  size_t at=events.size()*part/session_parts;
+  while(at<events.size()&&events[at].person==events[at-1].person)at++;
+  event_bounds[part]=at;
+ }
+ struct SessionCounts{size_t users=0,sessions=0,buys=0;};
+ vector<SessionCounts> counts(session_parts+1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t part=0;part<session_parts;part++){
+  SessionCounts count;
+  uint32_t previous=UINT32_MAX,last_time=0;int32_t last_day=INT32_MIN;
+  for(size_t i=event_bounds[part];i<event_bounds[part+1];i++){
+   const Evt& e=events[i];
+   if(e.person!=previous||uint64_t(e.t)-last_time>(uint64_t)GAP){
+    int32_t day=epoch_day(ws+(int64_t)e.t);
+    if(e.person!=previous||day!=last_day){count.users++;last_day=day;}
+    count.sessions++;
+   }
+   count.buys+=e.is_purchase;previous=e.person;last_time=e.t;
+  }
+  counts[part+1]=count;
+ }
+ for(size_t part=1;part<counts.size();part++){
+  counts[part].users+=counts[part-1].users;
+  counts[part].sessions+=counts[part-1].sessions;
+  counts[part].buys+=counts[part-1].buys;
+ }
+ vector<UserDay> ud(counts.back().users);
+ vector<Session> sessions(counts.back().sessions);
+ vector<Buy> buys(counts.back().buys);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t part=0;part<session_parts;part++){
+  size_t ui=counts[part].users,si=counts[part].sessions,bi=counts[part].buys;
+  uint32_t previous=UINT32_MAX,last_time=0;int32_t last_day=INT32_MIN;
+  for(size_t i=event_bounds[part];i<event_bounds[part+1];i++){
+   const Evt& e=events[i];
+   if(e.person!=previous||uint64_t(e.t)-last_time>(uint64_t)GAP){
+    int64_t start=ws+(int64_t)e.t;int32_t day=epoch_day(start);
+    if(e.person!=previous||day!=last_day){ud[ui++]={e.person,day};last_day=day;}
+    ud[ui-1].sessions++;
+    sessions[si++]={start,0,e.person,(uint32_t)(ui-1),organic,0,0};
+   }
+   previous=e.person;last_time=e.t;
+   auto& session=sessions[si-1];auto& user=ud[ui-1];user.events++;
+   if(e.is_purchase){
+    session.purchased=1;session.revenue+=e.price;user.revenue+=e.price;
+    buys[bi++]={(uint32_t)(ui-1),e.category,e.price};
+   }
+  }
+ }
+ vector<Evt>().swap(events);
+ cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
+ // Purchase category totals are per person-day, NOT per session, with byte-order ties.
+ sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
+ uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
+ for(size_t i=0;i<buys.size();){size_t j=i+1;int64_t amt=buys[i].price;while(j<buys.size()&&buys[j].userday==buys[i].userday&&buys[j].category==buys[i].category)amt+=buys[j++].price;
+  if(buys[i].userday!=curr){curr=buys[i].userday;bestamt=-1;bestcat=UINT16_MAX;}
+  uint16_t cat=buys[i].category;
+  if(amt>bestamt||(amt==bestamt && (bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){bestamt=amt;bestcat=cat;ud[curr].top_category=cat;}
+  i=j;
+ }
+ vector<Buy>().swap(buys);lap("top_category");
+ vector<CampDay> camp((size_t)campaigns.size()*nday);
+ order_clicks(clicks);lap("click_sort");
+ // Whole-person work units keep attribution cursors and assist intervals local
+ // to one worker. Aggregate into private campaign arrays, then reduce once.
  const int64_t click_base=ws-WEEK;
+ vector<pair<size_t,size_t>> spans(people.size(),{0,0}),click_spans(people.size(),{0,0});
+ for(size_t i=0;i<sessions.size();){size_t j=i+1;while(j<sessions.size()&&sessions[j].person==sessions[i].person)j++;spans[sessions[i].person]={i,j};i=j;}
+ for(size_t i=0;i<clicks.size();){size_t j=i+1;while(j<clicks.size()&&clicks[j].person==clicks[i].person)j++;click_spans[clicks[i].person]={i,j};i=j;}
+ vector<vector<CampDay>> campaign_totals(workers,vector<CampDay>(camp.size()));
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
  {
-  int tid=0;
+  size_t tid=0;
 #ifdef _OPENMP
-  tid=omp_get_thread_num();
+  tid=(size_t)omp_get_thread_num();
 #endif
-  auto& out_ud=ud_tls[tid];
-  auto& out_camp=camp_tls[tid];
-  vector<Session> ss;ss.reserve(32);
-  vector<Buy> buys;buys.reserve(16);
+  auto& totals=campaign_totals[tid];
+  auto aggregate=[&](uint16_t campaign,int32_t day)->CampDay&{return totals[(size_t)campaign*nday+day-day_base];};
+  auto count_assists=[&](uint32_t person,uint16_t campaign,int64_t a,int64_t b){
+   auto span=spans[person];
+   auto beg=sessions.begin()+span.first, end=sessions.begin()+span.second;
+   auto lo=lower_bound(beg,end,a,[](const Session&s,int64_t t){return s.start<t;});
+   auto hi=upper_bound(lo,end,b,[](int64_t t,const Session&s){return t<s.start;});
+   while(lo<hi){int32_t d=epoch_day(lo->start);int64_t until=(int64_t(d)+1)*DAY;
+    auto stop=lower_bound(lo,hi,until,[](const Session&s,int64_t t){return s.start<t;});
+    aggregate(campaign,d).assists+=stop-lo;lo=stop;
+   }
+  };
   vector<vector<uint32_t>> campaign_times(campaigns.size()-1);
-  vector<uint16_t> touched;touched.reserve(min<size_t>(campaigns.size(),128));
+  vector<uint16_t> touched;touched.reserve(min<size_t>(campaigns.size(),256));
 #ifdef _OPENMP
-#pragma omp for schedule(dynamic,256)
+#pragma omp for schedule(dynamic,32)
 #endif
   for(size_t person=0;person<people.size();person++){
-   size_t elo=event_off[person],ehi=event_off[person+1];
-   if(elo==ehi)continue;
-   ss.clear();buys.clear();
-   size_t ud_base=out_ud.size();
-   uint32_t lastt=0;bool first_event=true;
-   for(size_t ei=elo;ei<ehi;ei++){
-    const Evt&e=events[ei];
-    if(first_event||uint64_t(e.t)-lastt>(uint64_t)GAP){
-     int64_t start_abs=ws+(int64_t)e.t;
-     int32_t d=epoch_day(start_abs);
-     if(out_ud.size()==ud_base||out_ud.back().day!=d)out_ud.push_back({(uint32_t)person,d});
-     out_ud.back().sessions++;
-     ss.push_back({start_abs,0,(uint32_t)person,(uint32_t)(out_ud.size()-ud_base-1),organic,0,0});
-     first_event=false;
-    }
-    lastt=e.t;
-    Session& ses=ss.back();UserDay&u=out_ud[ud_base+ses.userday];u.events++;
-    if(e.is_purchase){ses.purchased=1;ses.revenue+=e.price;u.revenue+=e.price;buys.push_back({ses.userday,e.category,e.price});}
-   }
-
-   // Top category is per person-day. Local sorting keeps this work cache-local.
-   sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
-   uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
-   for(size_t bi=0;bi<buys.size();){
-    size_t bj=bi+1;int64_t amt=buys[bi].price;
-    while(bj<buys.size()&&buys[bj].userday==buys[bi].userday&&buys[bj].category==buys[bi].category)amt+=buys[bj++].price;
-    if(buys[bi].userday!=curr){curr=buys[bi].userday;bestamt=-1;bestcat=UINT16_MAX;}
-    uint16_t cat=buys[bi].category;
-    if(amt>bestamt||(amt==bestamt&&(bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){
-     bestamt=amt;bestcat=cat;out_ud[ud_base+curr].top_category=cat;
-    }
-    bi=bj;
-   }
-
-   // Last-click attribution: local merge of this person's sessions and click slice.
-   size_t c=click_off[person],cend=click_off[person+1];
+   auto [sb,se]=spans[person];if(sb==se)continue;
+   auto [i,j]=click_spans[person];size_t c=i;
    int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
-   for(Session& ses:ss){
-    uint32_t session_ct=(uint32_t)(ses.start-click_base);
-    while(c<cend&&clicks[c].t<=session_ct){
-     uint32_t ct=clicks[c].t;size_t j=c+1,best=c;
-     while(j<cend&&clicks[j].t==ct){if(byte_less(clicks[j].clickid,clicks[best].clickid))best=j;j++;}
-     lastclicktime=click_base+(int64_t)ct;lastcampaign=clicks[best].campaign;c=j;
+   for(size_t si=sb;si<se;si++){
+    auto& session=sessions[si];uint32_t session_ct=(uint32_t)(session.start-click_base);
+    while(c<j&&clicks[c].t<=session_ct){
+     uint32_t t=clicks[c].t;size_t stop=c+1,best=c;
+     while(stop<j&&clicks[stop].t==t){
+      if(byte_less(clicks[stop].clickid,clicks[best].clickid))best=stop;
+      stop++;
+     }
+     lastclicktime=click_base+(int64_t)t;lastcampaign=clicks[best].campaign;c=stop;
     }
-    uint16_t credited=(lastclicktime!=INT64_MIN&&ses.start-lastclicktime<=WEEK)?lastcampaign:organic;
-    auto& a=out_camp[(size_t)credited*nday+epoch_day(ses.start)-day_base];
-    a.sessions++;a.revenue+=ses.revenue;a.purchasing+=ses.purchased;
+    uint16_t credited=(lastclicktime!=INT64_MIN&&session.start-lastclicktime<=WEEK)?lastcampaign:organic;
+    auto& value=aggregate(credited,epoch_day(session.start));
+    value.sessions++;value.purchasing+=session.purchased;value.revenue+=session.revenue;
    }
-
-   // Assists: merge seven-day intervals independently for campaigns touched by this person.
    touched.clear();
-   for(size_t ci=click_off[person];ci<click_off[person+1];ci++){
-    uint16_t campaign=clicks[ci].campaign;
+   for(size_t z=i;z<j;z++){
+    uint16_t campaign=clicks[z].campaign;
     auto& times=campaign_times[campaign];
     if(times.empty())touched.push_back(campaign);
-    times.push_back(clicks[ci].t);
+    times.push_back(clicks[z].t);
    }
-   auto add_assists=[&](uint16_t campaign,int64_t from,int64_t to){
-    auto lo=lower_bound(ss.begin(),ss.end(),from,[](const Session&x,int64_t t){return x.start<t;});
-    auto hi=upper_bound(lo,ss.end(),to,[](int64_t t,const Session&x){return t<x.start;});
-    while(lo<hi){
-     int32_t d=epoch_day(lo->start);int64_t until=(int64_t(d)+1)*DAY;
-     auto stop=lower_bound(lo,hi,until,[](const Session&x,int64_t t){return x.start<t;});
-     out_camp[(size_t)campaign*nday+d-day_base].assists+=stop-lo;lo=stop;
-    }
-   };
    for(uint16_t campaign:touched){
     auto& times=campaign_times[campaign];
     int64_t from=click_base+(int64_t)times[0],to=from+WEEK;
     for(size_t z=1;z<times.size();z++){
-     int64_t a=click_base+(int64_t)times[z],bb=a+WEEK;
-     if(a<=to)to=max(to,bb);else{add_assists(campaign,from,to);from=a;to=bb;}
+     int64_t a=click_base+(int64_t)times[z],b=a+WEEK;
+     if(a<=to)to=max(to,b);else{count_assists((uint32_t)person,campaign,from,to);from=a;to=b;}
     }
-    add_assists(campaign,from,to);times.clear();
+    count_assists((uint32_t)person,campaign,from,to);
+    times.clear();
    }
   }
  }
- vector<Evt>().swap(events);vector<Click>().swap(clicks);
- event_off.clear();click_off.clear();
-
- size_t ud_total=0;for(auto&v:ud_tls)ud_total+=v.size();
- vector<UserDay> ud;ud.reserve(ud_total);
- for(auto&v:ud_tls){ud.insert(ud.end(),v.begin(),v.end());vector<UserDay>().swap(v);}
- vector<vector<UserDay>>().swap(ud_tls);
- vector<CampDay> camp(camp_cells);
- for(int t=0;t<nt;t++)for(size_t i=0;i<camp_cells;i++){
-  auto&s=camp_tls[t][i];auto&d=camp[i];
-  d.sessions+=s.sessions;d.purchasing+=s.purchasing;d.revenue+=s.revenue;d.assists+=s.assists;
+ for(const auto& totals:campaign_totals)for(size_t i=0;i<camp.size();i++){
+  camp[i].sessions+=totals[i].sessions;camp[i].purchasing+=totals[i].purchasing;
+  camp[i].revenue+=totals[i].revenue;camp[i].assists+=totals[i].assists;
  }
- vector<vector<CampDay>>().swap(camp_tls);
- lap("fused_person_state");
+ vector<Click>().swap(clicks);
+ lap("attribution_assists");
  fs::create_directories(out);
  fs::create_directories(out+"/user_daily");
  fs::create_directories(out+"/campaign_daily");
