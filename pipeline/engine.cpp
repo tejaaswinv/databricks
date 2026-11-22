@@ -372,7 +372,7 @@ static SV canonical_user_view(uint64_t v){
  thread_local char b[16];
  int at=15;static constexpr char d[]="0123456789abcdefghijklmnopqrstuvwxyz";
  do{b[at--]=d[v%36];v/=36;}while(v);b[at]='u';
- return SV(b+at,15-at);
+ return SV(b+at,16-at);
 }
 struct Evt{uint32_t t;uint32_t person;int32_t price;uint16_t category;uint8_t is_purchase;uint8_t unused;};
 struct Click{SV clickid;uint32_t t;uint32_t person;uint16_t campaign;uint16_t unused=0;};
