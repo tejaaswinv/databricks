@@ -758,14 +758,37 @@ int main(){
 #endif
   auto& cache=event_people_cache[lookup_tid];
   size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
+  // Exact two-pass duplicate filter: the first pass marks hash *buckets*
+  // containing two or more candidates. Every genuinely repeated event ID
+  // necessarily lands in a marked bucket. False positives are harmless because
+  // the marked rows still pass through the collision-safe exact dedup index.
+  // Most one-off IDs bypass expensive random-access dedup entirely.
+  size_t filter_bits=64;
+  while(filter_bits<n*16)filter_bits*=2;
+  vector<uint64_t> filter_seen(filter_bits/64,0),filter_repeat(filter_bits/64,0);
+  const size_t mask=filter_bits-1;
+  auto fingerprint=[&](const Cand& c)->size_t{
+   uint64_t key=(c.idtag&~NONCOMPACT_PAYLOAD)>>countr_zero(PARTS);
+   key*=0x9e3779b97f4a7c15ULL;
+   key^=key>>32;
+   return (size_t)key&mask;
+  };
+  for(size_t t=0;t<workers;t++)for(const Cand& c:raw[t*PARTS+part]){
+   size_t i=fingerprint(c),word=i>>6;uint64_t bit=1ULL<<(i&63);
+   filter_repeat[word]|=filter_seen[word]&bit;
+   filter_seen[word]|=bit;
+  }
   vector<Cand> cands;cands.reserve(n);
-  FlatEventIndex idx(cands,n,countr_zero(PARTS));
+  // Reserve only for the ambiguous minority, not all event IDs.
+  FlatEventIndex idx(cands,max<size_t>(16,n/8),countr_zero(PARTS));
   for(size_t t=0;t<workers;t++){
    auto& rows=raw[t*PARTS+part];
    for(const Cand& c:rows){
-      uint32_t ix=idx.get_or_create(c);
-      if(ix==UINT32_MAX)cands.push_back(c);
-      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
+    size_t i=fingerprint(c);
+    if(!(filter_repeat[i>>6]&(1ULL<<(i&63)))){cands.push_back(c);continue;}
+    uint32_t ix=idx.get_or_create(c);
+    if(ix==UINT32_MAX)cands.push_back(c);
+    else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
    }
    vector<Cand>().swap(rows);
   }
