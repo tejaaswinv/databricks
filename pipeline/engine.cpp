@@ -682,7 +682,7 @@ int main(){
   const char* first=header+1;
   if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(32,(span+4194303)/4194304));
+  size_t np=max<size_t>(1,min<size_t>(128,(span+262143)/262144));
   vector<const char*> bounds(np+1);
   bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){
