@@ -226,7 +226,7 @@ struct PackedNumPeople {
 // This cache is scoped to a phase with an immutable identity index. Separate
 // instances after standalone interning prevent stale negative click lookups.
 struct IdentityCache {
- static constexpr size_t SIZE=2048;
+ static constexpr size_t SIZE=65536;
  array<uint64_t,SIZE> keys{};
  array<uint32_t,SIZE> values{};
  uint32_t find(const PackedNumPeople& index,uint64_t key){
