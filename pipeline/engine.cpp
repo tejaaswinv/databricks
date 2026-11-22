@@ -441,6 +441,20 @@ struct FlatEventIndex {
   for(size_t i=0;i<packed.size();i++)wide[i]=uint32_t(packed[i]>>40);
   vector<uint64_t>().swap(packed);
  }
+ void prefetch_bucket(const Cand& c) const{
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__aarch64__))
+  uint64_t key=c.idtag&~NONCOMPACT_PAYLOAD;
+  if(!packed.empty()){
+   size_t p=(size_t)(key>>partition_bits)&(packed.size()-1);
+   __builtin_prefetch(&packed[p],0,1);
+  }else{
+   size_t p=(size_t)(key>>partition_bits)&(wide.size()-1);
+   __builtin_prefetch(&wide[p],0,1);
+  }
+#else
+  (void)c;
+#endif
+ }
  uint32_t get_or_create(const Cand& c){
   if(!packed.empty()&&rows.size()>=0xffffffU)widen();
   size_t capacity=packed.empty()?wide.size():packed.size();
@@ -770,7 +784,9 @@ int main(){
   FlatEventIndex idx(cands,n,countr_zero(PARTS));
   for(size_t t=0;t<workers;t++){
    auto& rows=raw[t*PARTS+part];
-   for(const Cand& c:rows){
+   for(size_t k=0;k<rows.size();k++){
+      if(k+12<rows.size())idx.prefetch_bucket(rows[k+12]);
+      const Cand& c=rows[k];
       uint32_t ix=idx.get_or_create(c);
       if(ix==UINT32_MAX)cands.push_back(c);
       else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
