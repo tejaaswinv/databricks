@@ -655,6 +655,21 @@ int main(){
  PackedNumPeople numeric_people=std::move(dsu.numeric);
  numeric_people.remap(link_person);
  advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),true);
+ // One-bit prefilter for the immutable linked canonical-ID set. It never
+ // decides membership: a set bit still goes through the exact hash table.
+ static constexpr size_t LINK_FILTER_BITS=1u<<23;
+ vector<uint64_t> linked_filter(LINK_FILTER_BITS/64);
+ for(size_t i=0;i<numeric_people.slots.size();i++)if(numeric_people.slots[i]){
+  uint64_t key=numeric_people.key_at(i);
+  uint64_t h=PackedNumPeople::hash_key(key);
+  size_t bit=(size_t)h&(LINK_FILTER_BITS-1);
+  linked_filter[bit>>6]|=1ULL<<(bit&63);
+ }
+ auto maybe_linked_numeric=[&](uint64_t key)->bool{
+  uint64_t h=PackedNumPeople::hash_key(key);
+  size_t bit=(size_t)h&(LINK_FILTER_BITS-1);
+  return (linked_filter[bit>>6]>>(bit&63))&1ULL;
+ };
  for(uint32_t i:dsu.special_nodes)person_map.add_link(dsu.nodes[i].value,link_person[i]);
  dsu.buckets.clear();dsu.buckets.shrink_to_fit();
  cerr<<"subphase link_build="<<chrono::duration<double>(links_built-links_start).count()<<"s canonicalize="<<chrono::duration<double>(chrono::steady_clock::now()-links_built).count()<<"s\n";
@@ -795,7 +810,9 @@ int main(){
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
    }
-   uint32_t p=(uk!=UINT64_MAX)?cache.find(numeric_people,uk):person_map.find_hashed(user,user_hash);
+   uint32_t p;
+   if(uk!=UINT64_MAX)p=maybe_linked_numeric(uk)?cache.find(numeric_people,uk):UINT32_MAX;
+   else p=person_map.find_hashed(user,user_hash);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
