@@ -872,64 +872,49 @@ int main(){
  people.resize(next_numeric.load(memory_order_relaxed));
  for(const auto& identities:new_numeric)for(const auto& [key,p]:identities)numeric_people.add(key,p);
  vector<PendingNum>().swap(numeric_rows);
- // Resolve noncanonical standalone IDs lock-free by hash shard.
+ // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
+ // so assignment order is irrelevant; every equal byte string still gets exactly one person.
  constexpr size_t ID_SHARDS=256;
- vector<size_t> string_counts(PARTS*ID_SHARDS),string_offsets(PARTS*ID_SHARDS);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  auto* counts=string_counts.data()+part*ID_SHARDS;
-  for(const auto& e:pending_by_part[part])counts[e.user_hash&(ID_SHARDS-1)]++;
- }
- array<size_t,ID_SHARDS+1> string_bounds{};
- size_t string_at=0;
- for(size_t sh=0;sh<ID_SHARDS;sh++){
-  string_bounds[sh]=string_at;
-  for(size_t part=0;part<PARTS;part++){
-   string_offsets[part*ID_SHARDS+sh]=string_at;
-   string_at+=string_counts[part*ID_SHARDS+sh];
-  }
- }
- string_bounds[ID_SHARDS]=string_at;
- vector<PendingEvt> string_rows(pending_n);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  auto* positions=string_offsets.data()+part*ID_SHARDS;
-  for(const auto&e:pending_by_part[part])string_rows[positions[e.user_hash&(ID_SHARDS-1)]++]=e;
-  vector<PendingEvt>().swap(pending_by_part[part]);
- }
- vector<vector<PendingEvt>>().swap(pending_by_part);
+ array<unordered_map<SV,uint32_t,Hash,Eq>,ID_SHARDS> standalone;
+ array<mutex,ID_SHARDS> standalone_mu;
+ size_t per_shard=max<size_t>(16,pending_n/24/ID_SHARDS+8);
+ for(auto& m:standalone)m.reserve(per_shard);
  uint32_t people_base=(uint32_t)people.size();
  people.resize((size_t)people_base+pending_n);
- events.resize(good_n+pending_num_n+pending_n);
  atomic<uint32_t> next_person(people_base);
- array<vector<pair<SV,uint32_t>>,ID_SHARDS> new_strings;
+ vector<vector<Evt>> resolved_pending(PARTS);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
 #endif
- for(size_t sh=0;sh<ID_SHARDS;sh++){
-  size_t first=string_bounds[sh],last=string_bounds[sh+1];
-  if(first==last)continue;
-  unordered_map<SV,uint32_t,Hash,Eq> local;
-  local.reserve(max<size_t>(16,(last-first)/20));
-  auto& identities=new_strings[sh];
-  for(size_t i=first;i<last;i++){
-   const auto&e=string_rows[i];
-   auto it=local.find(e.user);uint32_t p;
-   if(it==local.end()){
-    p=next_person.fetch_add(1,memory_order_relaxed);
-    local.emplace(e.user,p);identities.push_back({e.user,p});people[p]=e.user;
-   }else p=it->second;
-   events[good_n+pending_num_n+i]={e.t,p,e.price,e.category,e.is_purchase,0};
+ for(size_t part=0;part<PARTS;part++){
+  auto& src=pending_by_part[part];
+  auto& dst=resolved_pending[part];
+  dst.reserve(src.size());
+  for(const PendingEvt& e:src){
+   size_t h=e.user_hash, sh=h&(ID_SHARDS-1);
+   uint32_t p;
+   {
+    lock_guard<mutex> lock(standalone_mu[sh]);
+    auto& m=standalone[sh];
+    auto it=m.find(e.user);
+    if(it==m.end()){
+     p=next_person.fetch_add(1,memory_order_relaxed);
+     m.emplace(e.user,p);
+     people[p]=e.user;
+    }else p=it->second;
+   }
+   dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
   }
+  vector<PendingEvt>().swap(src);
  }
  uint32_t final_people=next_person.load(memory_order_relaxed);
  people.resize(final_people);
- for(const auto& identities:new_strings)for(const auto& [key,p]:identities)person_map.add_link(key,p);
- vector<PendingEvt>().swap(string_rows);
+ // Make the newly assigned IDs available to click processing. This is once per unique
+ // ID rather than once per event.
+ for(uint32_t p=people_base;p<final_people;p++)person_map.add_link(people[p],p);
+ for(auto& v:resolved_pending){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
+ vector<vector<Evt>>().swap(resolved_pending);
+ vector<vector<PendingEvt>>().swap(pending_by_part);
  auto validate_t2=chrono::steady_clock::now();
  cerr<<"subphase winner_validate="<<chrono::duration<double>(validate_t1-validate_t0).count()<<"s standalone_resolve="<<chrono::duration<double>(validate_t2-validate_t1).count()<<"s\n";
  cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<(pending_n+pending_num_n)<<"\n";lap("identity_resolve");
