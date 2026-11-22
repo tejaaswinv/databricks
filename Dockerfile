@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
 COPY pipeline /app/pipeline
-RUN g++ -std=c++20 -O3 -march=x86-64-v3 -mtune=haswell -fopenmp -flto -fno-semantic-interposition -fno-plt -DNDEBUG -o /app/engine /app/pipeline/engine.cpp
+RUN g++ -std=c++20 -O3 -fopenmp -flto -fno-semantic-interposition -fno-plt -DNDEBUG -o /app/engine /app/pipeline/engine.cpp
 
 FROM builder AS tests
 COPY tests /app/tests
