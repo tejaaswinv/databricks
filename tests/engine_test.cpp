@@ -90,7 +90,7 @@ static void radix_tests(){
  auto expected=events;
  auto key=[](const Evt& event){return (uint64_t(event.person)<<32)|event.t;};
  std::sort(expected.begin(),expected.end(),[&](const Evt& a,const Evt& b){return key(a)<key(b);});
- order_events(events);
+ order_events(events,10000);
  for(size_t i=0;i<events.size();i++)check(key(events[i])==key(expected[i]),"parallel radix order differs");
 }
 static void linked_identity_tests(){
@@ -159,4 +159,4 @@ static void event_index_tests(){
   }
  }
 }
-int main(){csv_tests();id_tests();time_tests();radix_tests();linked_identity_tests();event_index_tests();std::cout<<"parser, identity, timestamp and radix checks passed\n";}
+int main(){csv_tests();id_tests();time_tests();radix_tests();linked_identity_tests();event_index_tests();std::cout<<"parser, identity, timestamp and person-bucket checks passed\n";}
