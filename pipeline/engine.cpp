@@ -522,63 +522,32 @@ static int32_t parse_price(SV s) {
  return v>0?v:-1;
 }
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
-template<class T,class Key>
-static void radix64(vector<T>& a, Key key, int passes=4){
- if(a.size()<2)return;
- constexpr size_t R=1u<<16, MASK=R-1;
- int nt=1;
+template<class T,class Time>
+static vector<size_t> bucket_person_time(vector<T>& a,size_t person_count,Time time_key){
+ vector<size_t> off(person_count+1,0);
+ for(const T& x:a)off[(size_t)x.person+1]++;
+ for(size_t i=1;i<off.size();i++)off[i]+=off[i-1];
+ if(a.size()>1){
+  vector<size_t> pos=off;vector<T> tmp(a.size());
+  for(const T& x:a)tmp[pos[x.person]++]=x;a.swap(tmp);
 #ifdef _OPENMP
- nt=max(1,omp_get_max_threads());
+#pragma omp parallel for schedule(static)
 #endif
- if(a.size()<32768){sort(a.begin(),a.end(),[&](const T& x,const T& y){return key(x)<key(y);});return;}
- vector<T> tmp(a.size());
- vector<size_t> hist((size_t)nt*R), pos((size_t)nt*R);
- for(int pass=0;pass<passes;pass++){
-  fill(hist.begin(),hist.end(),0);
-  unsigned shift=pass*16;
-  int active=nt;
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-  {
-   int tid=0;
-#ifdef _OPENMP
-   tid=omp_get_thread_num();
-#pragma omp single
-   active=omp_get_num_threads();
-#endif
-   size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
-   size_t* h=hist.data()+(size_t)tid*R;
-   for(size_t i=lo;i<hi;i++)h[(key(a[i])>>shift)&MASK]++;
+  for(size_t person=0;person<person_count;person++){
+   size_t lo=off[person],hi=off[person+1],n=hi-lo;if(n<2)continue;T* q=a.data()+lo;
+   if(n<=16){for(size_t i=1;i<n;i++){T v=q[i];size_t j=i;while(j&&time_key(v)<time_key(q[j-1])){q[j]=q[j-1];--j;}q[j]=v;}}
+   else sort(q,q+n,[&](const T&x,const T&y){return time_key(x)<time_key(y);});
   }
-  size_t base=0;
-  for(size_t b=0;b<R;b++){
-   size_t total=0;
-   for(int t=0;t<active;t++)total+=hist[(size_t)t*R+b];
-   size_t p=base;
-   for(int t=0;t<active;t++){pos[(size_t)t*R+b]=p;p+=hist[(size_t)t*R+b];}
-   base+=total;
-  }
-#ifdef _OPENMP
-#pragma omp parallel num_threads(active)
-#endif
-  {
-   int tid=0;
-#ifdef _OPENMP
-   tid=omp_get_thread_num();
-#endif
-   size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
-   size_t* p=pos.data()+(size_t)tid*R;
-   for(size_t i=lo;i<hi;i++){size_t b=(key(a[i])>>shift)&MASK;tmp[p[b]++]=a[i];}
-  }
-  a.swap(tmp);
  }
+ return off;
 }
 static void order_events(vector<Evt>& es){
- radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
+ size_t people=0;for(const auto&e:es)people=max(people,(size_t)e.person+1);
+ bucket_person_time(es,people,[](const Evt&e){return e.t;});
 }
 static void order_clicks(vector<Click>& cs){
- radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
+ size_t people=0;for(const auto&c:cs)people=max(people,(size_t)c.person+1);
+ bucket_person_time(cs,people,[](const Click&c){return c.t;});
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
@@ -682,7 +651,7 @@ int main(){
   const char* first=header+1;
   if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(128,(span+262143)/262144));
+  size_t np=max<size_t>(1,min<size_t>(32,(span+4194303)/4194304));
   vector<const char*> bounds(np+1);
   bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){
@@ -928,7 +897,7 @@ int main(){
   const char* header=(const char*)memchr(m.p,'\n',m.n);if(!header)continue;
   const char* first=header+1;if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(64,(span+262143)/262144));
+  size_t np=max<size_t>(1,min<size_t>(32,(span+2097151)/2097152));
   vector<const char*> bounds(np+1);bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){const char* p=first+span*j/np;const char* q=(const char*)memchr(p,'\n',end-p);bounds[j]=q?q+1:end;}
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])click_chunks.push_back({bounds[j],bounds[j+1]});
