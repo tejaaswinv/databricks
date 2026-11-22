@@ -433,7 +433,7 @@ struct FlatEventIndex {
  vector<Cand>& rows;
  unsigned partition_bits;
  explicit FlatEventIndex(vector<Cand>& v,size_t expected,unsigned bits,bool force_wide=false):rows(v),partition_bits(bits){
-  size_t cap=16;while(cap<expected*2+16)cap*=2;
+  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
   if(expected<0xffffffU&&!force_wide)packed.resize(cap);else wide.resize(cap);
  }
  void widen(){
@@ -444,7 +444,7 @@ struct FlatEventIndex {
  uint32_t get_or_create(const Cand& c){
   if(!packed.empty()&&rows.size()>=0xffffffU)widen();
   size_t capacity=packed.empty()?wide.size():packed.size();
-  if(used*2>=capacity){grow();capacity=packed.empty()?wide.size():packed.size();}
+  if(used*10>=capacity*7){grow();capacity=packed.empty()?wide.size():packed.size();}
   uint64_t key=c.idtag&~NONCOMPACT_PAYLOAD;size_t mask=capacity-1,p=(size_t)(key>>partition_bits)&mask;
   if(!packed.empty()){
    for(;;){
@@ -841,10 +841,9 @@ int main(){
   vector<PendingNum>().swap(pending_num_by_part[part]);
  }
  vector<vector<PendingNum>>().swap(pending_num_by_part);
- array<deque<string>,NUM_SHARDS> owned_user_names;
  array<vector<pair<uint64_t,uint32_t>>,NUM_SHARDS> new_numeric;
  uint32_t numeric_base=(uint32_t)people.size();
- people.resize((size_t)numeric_base+pending_num_n);
+ // Do not resize people by pending event count: only unique identities need slots.
  events.resize(good_n+pending_num_n);
  atomic<uint32_t> next_numeric(numeric_base);
 #ifdef _OPENMP
@@ -854,23 +853,26 @@ int main(){
   size_t first=numeric_bounds[sh],last=numeric_bounds[sh+1];
   if(first==last)continue;
   PackedNumPeople local(max<size_t>(16,(last-first)/24));
-  auto& names=owned_user_names[sh];auto& identities=new_numeric[sh];
+  auto& identities=new_numeric[sh];
   for(size_t i=first;i<last;i++){
    const auto& e=numeric_rows[i];
-   // All keys in a shard share eight low bits. Remove those bits in the
-   // private table too, while retaining the complete ID in the global index.
    uint64_t local_key=e.key/NUM_SHARDS;
    uint32_t p=local.find(local_key);
    if(p==UINT32_MAX){
     p=next_numeric.fetch_add(1,memory_order_relaxed);
-    names.push_back(canonical_user_name(e.key));people[p]=names.back();
     local.add(local_key,p);identities.push_back({e.key,p});
    }
    events[good_n+i]={e.t,p,e.price,e.category,e.is_purchase,0};
   }
  }
- people.resize(next_numeric.load(memory_order_relaxed));
- for(const auto& identities:new_numeric)for(const auto& [key,p]:identities)numeric_people.add(key,p);
+ uint32_t numeric_final=next_numeric.load(memory_order_relaxed);
+ people.resize(numeric_final);
+ deque<string> owned_user_names;
+ for(const auto& identities:new_numeric)for(const auto& [key,p]:identities){
+  owned_user_names.push_back(canonical_user_name(key));
+  people[p]=owned_user_names.back();
+  numeric_people.add(key,p);
+ }
  vector<PendingNum>().swap(numeric_rows);
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
  // so assignment order is irrelevant; every equal byte string still gets exactly one person.
