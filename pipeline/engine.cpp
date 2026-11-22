@@ -278,7 +278,7 @@ static UnionFind build_links(vector<Mapping>& maps,const vector<fs::path>& paths
   if(!header)continue;
   const char* first=header+1;if(first==end)continue;
   raw_nodes+=2*(size_t(std::count(first,end,'\n'))+(end[-1]!='\n'));
-  size_t span=end-first,np=max<size_t>(1,(span+262143)/262144);
+  size_t span=end-first,np=max<size_t>(1,(span+1048575)/1048576);
   const char* begin=first;
   for(size_t part=1;part<=np;part++){
    const char* stop=end;
