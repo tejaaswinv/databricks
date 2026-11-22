@@ -363,38 +363,38 @@ struct FastOut{
  }
 };
 template<class T,class Time>
-static void bucket_person_time(vector<T>& a,size_t person_count,Time time_key){
- if(a.size()<2)return;
+static vector<size_t> bucket_person_time(vector<T>& a,size_t person_count,Time time_key){
  vector<size_t> off(person_count+1,0);
  for(const T& x:a)off[(size_t)x.person+1]++;
  for(size_t i=1;i<off.size();i++)off[i]+=off[i-1];
- vector<size_t> pos=off;
- vector<T> tmp(a.size());
- for(const T& x:a)tmp[pos[x.person]++]=x;
- a.swap(tmp);
+ if(a.size()>1){
+  vector<size_t> pos=off;
+  vector<T> tmp(a.size());
+  for(const T& x:a)tmp[pos[x.person]++]=x;
+  a.swap(tmp);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
- for(size_t p=0;p<person_count;p++){
-  size_t lo=off[p],hi=off[p+1],n=hi-lo;
-  if(n<2)continue;
-  T* b=a.data()+lo;
-  if(n<=16){
-   for(size_t i=1;i<n;i++){
-    T v=b[i];size_t j=i;
-    while(j&&time_key(v)<time_key(b[j-1])){b[j]=b[j-1];--j;}
-    b[j]=v;
-   }
-  }else{
-   sort(b,b+n,[&](const T&x,const T&y){return time_key(x)<time_key(y);});
+  for(size_t p=0;p<person_count;p++){
+   size_t lo=off[p],hi=off[p+1],n=hi-lo;
+   if(n<2)continue;
+   T* q=a.data()+lo;
+   if(n<=16){
+    for(size_t i=1;i<n;i++){
+     T v=q[i];size_t j=i;
+     while(j&&time_key(v)<time_key(q[j-1])){q[j]=q[j-1];--j;}
+     q[j]=v;
+    }
+   }else sort(q,q+n,[&](const T&x,const T&y){return time_key(x)<time_key(y);});
   }
  }
+ return off;
 }
-static void order_events(vector<Evt>& es,size_t people){
- bucket_person_time(es,people,[](const Evt&e){return e.t;});
+static vector<size_t> order_events(vector<Evt>& es,size_t people){
+ return bucket_person_time(es,people,[](const Evt&e){return e.t;});
 }
-static void order_clicks(vector<Click>& cs,size_t people){
- bucket_person_time(cs,people,[](const Click&c){return c.t;});
+static vector<size_t> order_clicks(vector<Click>& cs,size_t people){
+ return bucket_person_time(cs,people,[](const Click&c){return c.t;});
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
@@ -758,101 +758,125 @@ int main(){
  }
  vector<vector<ClickCand>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
- // Sessions from globally sorted valid events, across every linked ID.
- order_events(events,people.size());lap("event_bucket_sort");
- vector<UserDay> ud;ud.reserve(people.size()*2);
- vector<Session> sessions;sessions.reserve(events.size()/4+1);
- vector<Buy> buys;buys.reserve(events.size()/32+1);
- uint32_t lastperson=UINT32_MAX,lastt=0;
- for(const Evt&e:events){
-  if(e.person!=lastperson||uint64_t(e.t)-lastt>(uint64_t)GAP){
-   int64_t start=ws+(int64_t)e.t;
-   int32_t d=epoch_day(start);
-   if(ud.empty()||ud.back().person!=e.person||ud.back().day!=d)ud.push_back({e.person,d});
-   ud.back().sessions++;
-   sessions.push_back({start,0,e.person,(uint32_t)(ud.size()-1),organic,0,0});
-  }
-  lastperson=e.person;lastt=e.t;
-  Session& s=sessions.back();UserDay&u=ud[s.userday];u.events++;
-  if(e.is_purchase){s.purchased=1;s.revenue+=e.price;u.revenue+=e.price;buys.push_back({s.userday,e.category,e.price});}
- }
- vector<Evt>().swap(events);
- cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
- // Purchase category totals are per person-day, NOT per session, with byte-order ties.
- sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
- uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
- for(size_t i=0;i<buys.size();){size_t j=i+1;int64_t amt=buys[i].price;while(j<buys.size()&&buys[j].userday==buys[i].userday&&buys[j].category==buys[i].category)amt+=buys[j++].price;
-  if(buys[i].userday!=curr){curr=buys[i].userday;bestamt=-1;bestcat=UINT16_MAX;}
-  uint16_t cat=buys[i].category;
-  if(amt>bestamt||(amt==bestamt && (bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){bestamt=amt;bestcat=cat;ud[curr].top_category=cat;}
-  i=j;
- }
- vector<Buy>().swap(buys);lap("top_category");
- vector<CampDay> camp((size_t)campaigns.size()*nday);
- auto campref=[&](uint16_t id,int32_t day)->CampDay&{return camp[(size_t)id*nday+day-day_base];};
- order_clicks(clicks,people.size());lap("click_bucket_sort");
- // A single latest click cursor gives correct inclusive, 7-day, byte-wise tie attribution.
- size_t c=0;uint32_t prev_person=UINT32_MAX;
- int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
+ // Dense person bucketing replaces global sorting. Each person's tiny time slice is
+ // independently ordered, then sessionization + attribution + assists are fused per person.
+ auto event_off=order_events(events,people.size());lap("event_bucket_sort");
+ auto click_off=order_clicks(clicks,people.size());lap("click_bucket_sort");
+ const int nt=max(1,ncpu);
+ const size_t camp_cells=(size_t)campaigns.size()*nday;
+ vector<vector<UserDay>> ud_tls(nt);
+ vector<vector<CampDay>> camp_tls(nt,vector<CampDay>(camp_cells));
+ for(auto&v:ud_tls)v.reserve(max<size_t>(64,people.size()*2/(size_t)nt));
  const int64_t click_base=ws-WEEK;
- for(Session& s:sessions){
-  if(s.person!=prev_person){prev_person=s.person;lastclicktime=INT64_MIN;lastcampaign=organic;
-   while(c<clicks.size()&&clicks[c].person<s.person)c++;
-  }
-  uint32_t session_ct=(uint32_t)(s.start-click_base);
-  while(c<clicks.size()&&clicks[c].person==s.person&&clicks[c].t<=session_ct){
-   uint32_t t=clicks[c].t;size_t j=c+1;size_t best=c;
-   while(j<clicks.size()&&clicks[j].person==s.person&&clicks[j].t==t){
-    if(byte_less(clicks[j].clickid,clicks[best].clickid))best=j;
-    j++;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+ {
+  int tid=0;
+#ifdef _OPENMP
+  tid=omp_get_thread_num();
+#endif
+  auto& out_ud=ud_tls[tid];
+  auto& out_camp=camp_tls[tid];
+  vector<Session> ss;ss.reserve(32);
+  vector<Buy> buys;buys.reserve(16);
+  vector<vector<uint32_t>> campaign_times(campaigns.size()-1);
+  vector<uint16_t> touched;touched.reserve(min<size_t>(campaigns.size(),128));
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic,256)
+#endif
+  for(size_t person=0;person<people.size();person++){
+   size_t elo=event_off[person],ehi=event_off[person+1];
+   if(elo==ehi)continue;
+   ss.clear();buys.clear();
+   size_t ud_base=out_ud.size();
+   uint32_t lastt=0;bool first_event=true;
+   for(size_t ei=elo;ei<ehi;ei++){
+    const Evt&e=events[ei];
+    if(first_event||uint64_t(e.t)-lastt>(uint64_t)GAP){
+     int64_t start_abs=ws+(int64_t)e.t;
+     int32_t d=epoch_day(start_abs);
+     if(out_ud.size()==ud_base||out_ud.back().day!=d)out_ud.push_back({(uint32_t)person,d});
+     out_ud.back().sessions++;
+     ss.push_back({start_abs,0,(uint32_t)person,(uint32_t)(out_ud.size()-ud_base-1),organic,0,0});
+     first_event=false;
+    }
+    lastt=e.t;
+    Session& ses=ss.back();UserDay&u=out_ud[ud_base+ses.userday];u.events++;
+    if(e.is_purchase){ses.purchased=1;ses.revenue+=e.price;u.revenue+=e.price;buys.push_back({ses.userday,e.category,e.price});}
    }
-   lastclicktime=click_base+(int64_t)t;lastcampaign=clicks[best].campaign;c=j;
-  }
-  uint16_t credited=(lastclicktime!=INT64_MIN && s.start-lastclicktime<=WEEK)?lastcampaign:organic;
-  s.credited=credited;
-  auto &a=campref(credited,epoch_day(s.start));a.sessions++;a.revenue+=s.revenue;a.purchasing+=s.purchased;
- }
- lap("attribution");
- // Assist counting reuses clicks already sorted by (person,time). For each person,
- // campaign time lists inherit time order, so no second global assist sort is needed.
- vector<pair<size_t,size_t>> spans(people.size(),{0,0});
- for(size_t i=0;i<sessions.size();){size_t j=i+1;while(j<sessions.size()&&sessions[j].person==sessions[i].person)j++;spans[sessions[i].person]={i,j};i=j;}
- auto count_assists=[&](uint32_t person,uint16_t campaign,int64_t a,int64_t b){
-  auto span=spans[person];if(span.first==span.second)return;
-  auto beg=sessions.begin()+span.first, end=sessions.begin()+span.second;
-  auto lo=lower_bound(beg,end,a,[](const Session&s,int64_t t){return s.start<t;});
-  auto hi=upper_bound(lo,end,b,[](int64_t t,const Session&s){return t<s.start;});
-  while(lo<hi){int32_t d=epoch_day(lo->start);int64_t until=(int64_t(d)+1)*DAY;
-   auto stop=lower_bound(lo,hi,until,[](const Session&s,int64_t t){return s.start<t;});
-   campref(campaign,d).assists+=stop-lo;lo=stop;
-  }
- };
- vector<vector<uint32_t>> campaign_times(campaigns.size()-1);
- vector<uint16_t> touched;touched.reserve(min<size_t>(campaigns.size(),256));
- for(size_t i=0;i<clicks.size();){
-  uint32_t p=clicks[i].person;size_t j=i+1;
-  while(j<clicks.size()&&clicks[j].person==p)j++;
-  touched.clear();
-  for(size_t z=i;z<j;z++){
-   uint16_t campaign=clicks[z].campaign;
-   auto& times=campaign_times[campaign];
-   if(times.empty())touched.push_back(campaign);
-   times.push_back(clicks[z].t);
-  }
-  for(uint16_t campaign:touched){
-   auto& times=campaign_times[campaign];
-   int64_t from=click_base+(int64_t)times[0],to=from+WEEK;
-   for(size_t z=1;z<times.size();z++){
-    int64_t a=click_base+(int64_t)times[z],b=a+WEEK;
-    if(a<=to)to=max(to,b);else{count_assists(p,campaign,from,to);from=a;to=b;}
+
+   // Top category is per person-day. Local sorting keeps this work cache-local.
+   sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
+   uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
+   for(size_t bi=0;bi<buys.size();){
+    size_t bj=bi+1;int64_t amt=buys[bi].price;
+    while(bj<buys.size()&&buys[bj].userday==buys[bi].userday&&buys[bj].category==buys[bi].category)amt+=buys[bj++].price;
+    if(buys[bi].userday!=curr){curr=buys[bi].userday;bestamt=-1;bestcat=UINT16_MAX;}
+    uint16_t cat=buys[bi].category;
+    if(amt>bestamt||(amt==bestamt&&(bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){
+     bestamt=amt;bestcat=cat;out_ud[ud_base+curr].top_category=cat;
+    }
+    bi=bj;
    }
-   count_assists(p,campaign,from,to);
-   times.clear();
+
+   // Last-click attribution: local merge of this person's sessions and click slice.
+   size_t c=click_off[person],cend=click_off[person+1];
+   int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
+   for(Session& ses:ss){
+    uint32_t session_ct=(uint32_t)(ses.start-click_base);
+    while(c<cend&&clicks[c].t<=session_ct){
+     uint32_t ct=clicks[c].t;size_t j=c+1,best=c;
+     while(j<cend&&clicks[j].t==ct){if(byte_less(clicks[j].clickid,clicks[best].clickid))best=j;j++;}
+     lastclicktime=click_base+(int64_t)ct;lastcampaign=clicks[best].campaign;c=j;
+    }
+    uint16_t credited=(lastclicktime!=INT64_MIN&&ses.start-lastclicktime<=WEEK)?lastcampaign:organic;
+    auto& a=out_camp[(size_t)credited*nday+epoch_day(ses.start)-day_base];
+    a.sessions++;a.revenue+=ses.revenue;a.purchasing+=ses.purchased;
+   }
+
+   // Assists: merge seven-day intervals independently for campaigns touched by this person.
+   touched.clear();
+   for(size_t ci=click_off[person];ci<click_off[person+1];ci++){
+    uint16_t campaign=clicks[ci].campaign;
+    auto& times=campaign_times[campaign];
+    if(times.empty())touched.push_back(campaign);
+    times.push_back(clicks[ci].t);
+   }
+   auto add_assists=[&](uint16_t campaign,int64_t from,int64_t to){
+    auto lo=lower_bound(ss.begin(),ss.end(),from,[](const Session&x,int64_t t){return x.start<t;});
+    auto hi=upper_bound(lo,ss.end(),to,[](int64_t t,const Session&x){return t<x.start;});
+    while(lo<hi){
+     int32_t d=epoch_day(lo->start);int64_t until=(int64_t(d)+1)*DAY;
+     auto stop=lower_bound(lo,hi,until,[](const Session&x,int64_t t){return x.start<t;});
+     out_camp[(size_t)campaign*nday+d-day_base].assists+=stop-lo;lo=stop;
+    }
+   };
+   for(uint16_t campaign:touched){
+    auto& times=campaign_times[campaign];
+    int64_t from=click_base+(int64_t)times[0],to=from+WEEK;
+    for(size_t z=1;z<times.size();z++){
+     int64_t a=click_base+(int64_t)times[z],bb=a+WEEK;
+     if(a<=to)to=max(to,bb);else{add_assists(campaign,from,to);from=a;to=bb;}
+    }
+    add_assists(campaign,from,to);times.clear();
+   }
   }
-  i=j;
  }
- vector<Click>().swap(clicks);
- lap("assist_count");
+ vector<Evt>().swap(events);vector<Click>().swap(clicks);
+ event_off.clear();click_off.clear();
+
+ size_t ud_total=0;for(auto&v:ud_tls)ud_total+=v.size();
+ vector<UserDay> ud;ud.reserve(ud_total);
+ for(auto&v:ud_tls){ud.insert(ud.end(),v.begin(),v.end());vector<UserDay>().swap(v);}
+ vector<vector<UserDay>>().swap(ud_tls);
+ vector<CampDay> camp(camp_cells);
+ for(int t=0;t<nt;t++)for(size_t i=0;i<camp_cells;i++){
+  auto&s=camp_tls[t][i];auto&d=camp[i];
+  d.sessions+=s.sessions;d.purchasing+=s.purchasing;d.revenue+=s.revenue;d.assists+=s.assists;
+ }
+ vector<vector<CampDay>>().swap(camp_tls);
+ lap("fused_person_state");
  fs::create_directories(out);
  fs::create_directories(out+"/user_daily");
  fs::create_directories(out+"/campaign_daily");
