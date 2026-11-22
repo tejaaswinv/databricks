@@ -14,6 +14,8 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
+#include <thread>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -630,35 +632,23 @@ int main(){
  uint16_t organic=campaigns.size();campaigns.push_back("organic");channels.push_back("organic");
  auto link_paths=input_files(data+"/links");
  auto links_start=chrono::steady_clock::now();
- UnionFind dsu=build_links(maps,link_paths,ncpu);
- auto links_built=chrono::steady_clock::now();
- vector<int32_t> rootperson(dsu.nodes.size(),-1),min_node(dsu.nodes.size(),-1);
- vector<uint32_t> roots(dsu.nodes.size());
+ vector<Mapping> link_maps;link_maps.reserve(link_paths.size());
+ optional<UnionFind> dsu_ready;
+ chrono::steady_clock::time_point links_built;
+ int link_threads=ncpu>=4?max(1,ncpu/4):1;
+ int event_threads=ncpu>=4?max(1,ncpu-link_threads):ncpu;
+ thread link_worker([&]{
 #ifdef _OPENMP
-#pragma omp parallel for if(dsu.nodes.size()>20000)
+  omp_set_num_threads(link_threads);
 #endif
- for(size_t i=0;i<dsu.nodes.size();i++){
-  int r=concurrent_root(dsu.nodes,(int)i);roots[i]=(uint32_t)r;
-  int32_t previous=__atomic_load_n(&min_node[r],__ATOMIC_ACQUIRE);
-  while(previous<0||byte_less(dsu.nodes[i].value,dsu.nodes[previous].value)){
-   if(__atomic_compare_exchange_n(&min_node[r],&previous,(int32_t)i,true,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
-  }
- }
- vector<SV> people;people.reserve(dsu.nodes.size()/2);
- for(size_t i=0;i<min_node.size();i++)if(min_node[i]>=0){rootperson[i]=(int32_t)people.size();people.push_back(dsu.nodes[min_node[i]].value);}
- vector<uint32_t> link_person(dsu.nodes.size());
+  dsu_ready.emplace(build_links(link_maps,link_paths,link_threads));
+  links_built=chrono::steady_clock::now();
+ });
 #ifdef _OPENMP
-#pragma omp parallel for if(dsu.nodes.size()>20000)
+ omp_set_num_threads(event_threads);
 #endif
- for(size_t i=0;i<dsu.nodes.size();i++)link_person[i]=(uint32_t)rootperson[roots[i]];
- FastPeople person_map(people,max<size_t>(2048,dsu.nodes.size()/32+128));
- PackedNumPeople numeric_people=std::move(dsu.numeric);
- numeric_people.remap(link_person);
- advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),true);
- for(uint32_t i:dsu.special_nodes)person_map.add_link(dsu.nodes[i].value,link_person[i]);
- dsu.buckets.clear();dsu.buckets.shrink_to_fit();
- cerr<<"subphase link_build="<<chrono::duration<double>(links_built-links_start).count()<<"s canonicalize="<<chrono::duration<double>(chrono::steady_clock::now()-links_built).count()<<"s\n";
- cerr<<"links nodes="<<dsu.nodes.size()<<"\n";lap("links_dims");
+ // Event parsing is independent of identity canonicalization; overlap both stages.
+ mark=chrono::steady_clock::now();
  // Event dedup happens before *all* event validation.
  // Batch parse in parallel, then independently deduplicate by exact event ID.
  auto event_paths=input_files(data+"/events");
@@ -743,6 +733,14 @@ int main(){
   }
  }
  lap("event_parse");
+ link_worker.join();
+#ifdef _OPENMP
+ omp_set_num_threads(ncpu);
+#endif
+ for(auto& m:link_maps)maps.push_back(std::move(m));
+ UnionFind dsu=std::move(*dsu_ready);
+ auto canon_start=chrono::steady_clock::now();
+
  vector<IdentityCache> event_people_cache(workers);
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
