@@ -33,6 +33,14 @@ jobs:
           f=$(find dev/clicks -name '*.csv' | head -1); head -6 "$f"
           echo '=== generator source hints ==='
           grep -R -n -E 'event_id|click_id|ingest_ts|base36|timestamp|duplicate' generator/src | head -100 || true
+      - name: Inspect generator ID construction
+        run: |
+          echo '=== generator source files ==='
+          find generator/src -maxdepth 2 -type f -print
+          echo '=== ID-related generator source ==='
+          grep -R -n -E 'base36|event|click|duplicate|dup|scram|permute|user' generator/src | head -400 || true
+          echo '=== main source ==='
+          sed -n '1,500p' generator/src/main.rs || true
       - name: Build submission image
         run: docker build --platform linux/amd64 -t shopping-sessions:latest .
       - name: Install official checker dependency
