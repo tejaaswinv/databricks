@@ -522,20 +522,20 @@ static int32_t parse_price(SV s) {
  return v>0?v:-1;
 }
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
-template<class T,class Key>
+template<unsigned BITS=16,class T,class Key>
 static void radix64(vector<T>& a, Key key, int passes=4){
  if(a.size()<2)return;
- constexpr size_t R=1u<<16, MASK=R-1;
+ constexpr size_t R=1u<<BITS, MASK=R-1;
  int nt=1;
 #ifdef _OPENMP
  nt=max(1,omp_get_max_threads());
 #endif
- if(a.size()<32768){sort(a.begin(),a.end(),[&](const T& x,const T& y){return key(x)<key(y);});return;}
+ if(a.size()<32768||a.size()>=UINT32_MAX){sort(a.begin(),a.end(),[&](const T& x,const T& y){return key(x)<key(y);});return;}
  vector<T> tmp(a.size());
- vector<size_t> hist((size_t)nt*R), pos((size_t)nt*R);
+ vector<uint32_t> hist((size_t)nt*R), pos((size_t)nt*R);
  for(int pass=0;pass<passes;pass++){
   fill(hist.begin(),hist.end(),0);
-  unsigned shift=pass*16;
+  unsigned shift=pass*BITS;
   int active=nt;
 #ifdef _OPENMP
 #pragma omp parallel
@@ -548,14 +548,14 @@ static void radix64(vector<T>& a, Key key, int passes=4){
    active=omp_get_num_threads();
 #endif
    size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
-   size_t* h=hist.data()+(size_t)tid*R;
+   uint32_t* h=hist.data()+(size_t)tid*R;
    for(size_t i=lo;i<hi;i++)h[(key(a[i])>>shift)&MASK]++;
   }
   size_t base=0;
   for(size_t b=0;b<R;b++){
-   size_t total=0;
+   uint32_t total=0;
    for(int t=0;t<active;t++)total+=hist[(size_t)t*R+b];
-   size_t p=base;
+   uint32_t p=(uint32_t)base;
    for(int t=0;t<active;t++){pos[(size_t)t*R+b]=p;p+=hist[(size_t)t*R+b];}
    base+=total;
   }
@@ -568,17 +568,25 @@ static void radix64(vector<T>& a, Key key, int passes=4){
    tid=omp_get_thread_num();
 #endif
    size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
-   size_t* p=pos.data()+(size_t)tid*R;
+   uint32_t* p=pos.data()+(size_t)tid*R;
    for(size_t i=lo;i<hi;i++){size_t b=(key(a[i])>>shift)&MASK;tmp[p[b]++]=a[i];}
   }
   a.swap(tmp);
  }
 }
-static void order_events(vector<Evt>& es){
- radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
+static void order_events(vector<Evt>& es,size_t person_count,int64_t window_ms){
+ // For the normal generated windows, timestamps fit 31 bits. Person IDs up
+ // to 23 bits can be ordered exactly in three 18-bit LSD passes.
+ if(person_count<(1u<<23)&&window_ms<(1LL<<31))
+  radix64<18>(es,[](const Evt&e){return (uint64_t(e.person)<<31)|e.t;},3);
+ else
+  radix64<16>(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
-static void order_clicks(vector<Click>& cs){
- radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
+static void order_clicks(vector<Click>& cs,size_t person_count,int64_t click_window_ms){
+ if(person_count<(1u<<23)&&click_window_ms<(1LL<<31))
+  radix64<18>(cs,[](const Click&c){return (uint64_t(c.person)<<31)|c.t;},3);
+ else
+  radix64<16>(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
@@ -1000,7 +1008,7 @@ int main(){
  vector<vector<Click>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
  // Sessions from globally sorted valid events, across every linked ID.
- order_events(events);lap("event_sort");
+ order_events(events,people.size(),we-ws);lap("event_sort");
  // Count output ranges first so independent groups of whole people can write
  // directly into final arrays. No locks or concatenation of session copies.
  size_t session_parts=min<size_t>(workers*4,max<size_t>(1,events.size()/65536));
@@ -1075,7 +1083,7 @@ int main(){
  cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
  lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
- order_clicks(clicks);lap("click_sort");
+ order_clicks(clicks,people.size(),we-ws+WEEK);lap("click_sort");
  // Whole-person work units keep attribution cursors and assist intervals local
  // to one worker. Aggregate into private campaign arrays, then reduce once.
  const int64_t click_base=ws-WEEK;
