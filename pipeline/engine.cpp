@@ -574,71 +574,12 @@ static void radix64(vector<T>& a, Key key, int passes=4){
   a.swap(tmp);
  }
 }
-template<class T>
-static void dense_person_time_order(vector<T>& a,size_t people_count){
- if(a.size()<2)return;
- int nt=1;
-#ifdef _OPENMP
- nt=max(1,omp_get_max_threads());
-#endif
- vector<uint32_t> local((size_t)nt*people_count,0), totals(people_count), bounds(people_count+1), offsets((size_t)nt*people_count);
-#ifdef _OPENMP
-#pragma omp parallel num_threads(nt)
-#endif
- {
-  int tid=0;
-#ifdef _OPENMP
-  tid=omp_get_thread_num();
-#endif
-  size_t lo=a.size()*(size_t)tid/nt,hi=a.size()*(size_t)(tid+1)/nt;
-  uint32_t* c=local.data()+(size_t)tid*people_count;
-  for(size_t i=lo;i<hi;i++)c[a[i].person]++;
- }
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
- for(size_t p=0;p<people_count;p++){
-  uint32_t n=0;for(int t=0;t<nt;t++)n+=local[(size_t)t*people_count+p];totals[p]=n;
- }
- for(size_t p=0;p<people_count;p++)bounds[p+1]=bounds[p]+totals[p];
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
- for(size_t p=0;p<people_count;p++){
-  uint32_t at=bounds[p];
-  for(int t=0;t<nt;t++){offsets[(size_t)t*people_count+p]=at;at+=local[(size_t)t*people_count+p];}
- }
- vector<T> tmp(a.size());
-#ifdef _OPENMP
-#pragma omp parallel num_threads(nt)
-#endif
- {
-  int tid=0;
-#ifdef _OPENMP
-  tid=omp_get_thread_num();
-#endif
-  size_t lo=a.size()*(size_t)tid/nt,hi=a.size()*(size_t)(tid+1)/nt;
-  uint32_t* pos=offsets.data()+(size_t)tid*people_count;
-  for(size_t i=lo;i<hi;i++)tmp[pos[a[i].person]++]=a[i];
- }
- a.swap(tmp);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,256)
-#endif
- for(size_t p=0;p<people_count;p++){
-  size_t b=bounds[p],e=bounds[p+1],n=e-b;
-  if(n<2)continue;
-  if(n<=64){
-   for(size_t i=b+1;i<e;i++){
-    T x=a[i];size_t j=i;
-    while(j>b&&x.t<a[j-1].t){a[j]=a[j-1];--j;}
-    a[j]=x;
-   }
-  }else sort(a.begin()+b,a.begin()+e,[](const T&x,const T&y){return x.t<y.t;});
- }
+static void order_events(vector<Evt>& es){
+ radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
-static void order_events(vector<Evt>& es,size_t people_count){dense_person_time_order(es,people_count);}
-static void order_clicks(vector<Click>& cs,size_t people_count){dense_person_time_order(cs,people_count);}
+static void order_clicks(vector<Click>& cs){
+ radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
+}
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
  const string out=getenv("OUTPUT_DIR")?getenv("OUTPUT_DIR"):"/output";
@@ -1059,7 +1000,7 @@ int main(){
  vector<vector<Click>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
  // Sessions from globally sorted valid events, across every linked ID.
- order_events(events,people.size());lap("event_bucket_order");
+ order_events(events);lap("event_sort");
  // Count output ranges first so independent groups of whole people can write
  // directly into final arrays. No locks or concatenation of session copies.
  size_t session_parts=min<size_t>(workers*4,max<size_t>(1,events.size()/65536));
@@ -1134,7 +1075,7 @@ int main(){
  cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
  lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
- order_clicks(clicks,people.size());lap("click_bucket_order");
+ order_clicks(clicks);lap("click_sort");
  // Whole-person work units keep attribution cursors and assist intervals local
  // to one worker. Aggregate into private campaign arrays, then reduce once.
  const int64_t click_base=ws-WEEK;
