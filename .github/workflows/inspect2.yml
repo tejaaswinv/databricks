@@ -1,0 +1,21 @@
+name: Inspect generator IDs and manifest
+on:
+  push:
+    branches: [inspect-generator]
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          curl -fsSL --retry 3 'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip' -o /tmp/generator.zip
+          rm -rf /tmp/gen && mkdir /tmp/gen && unzip -q /tmp/generator.zip -d /tmp/gen
+          echo '=== files ==='
+          find /tmp/gen -maxdepth 3 -type f -print
+          echo '=== scramble/base36/keys/seed ==='
+          grep -RInE 'scramble|base36|event_key|click_key|user_key|seed|manifest|window_start|window_end|ChaCha|StdRng|rng' /tmp/gen/generator/src | head -n 500
+          for f in /tmp/gen/generator/src/*.rs; do
+            if grep -qE 'scramble|event_key|click_key|user_key|manifest|struct Manifest|seed' "$f"; then
+              echo "=== FILE $f ==="; cat "$f";
+            fi
+          done
