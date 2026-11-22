@@ -744,6 +744,7 @@ int main(){
  }
  lap("event_parse");
  vector<IdentityCache> event_people_cache(workers);
+ atomic<long long> dedup_cpu_ns{0},winner_cpu_ns{0};
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
  vector<vector<PendingNum>> pending_num_by_part(PARTS);
@@ -752,6 +753,7 @@ int main(){
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<PARTS;part++){
+  auto phase_a=chrono::steady_clock::now();
   size_t lookup_tid=0;
 #ifdef _OPENMP
   lookup_tid=(size_t)omp_get_thread_num();
@@ -769,6 +771,7 @@ int main(){
    }
    vector<Cand>().swap(rows);
   }
+  auto phase_b=chrono::steady_clock::now();
   auto& rows=cands;
   auto& good=valid_by_part[part];
   auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
@@ -801,8 +804,12 @@ int main(){
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
+  auto phase_c=chrono::steady_clock::now();
+  dedup_cpu_ns.fetch_add(chrono::duration_cast<chrono::nanoseconds>(phase_b-phase_a).count(),memory_order_relaxed);
+  winner_cpu_ns.fetch_add(chrono::duration_cast<chrono::nanoseconds>(phase_c-phase_b).count(),memory_order_relaxed);
  }
  vector<vector<Cand>>().swap(raw);
+ cerr<<"subphase event_dedup_cpu="<<(dedup_cpu_ns.load()*1e-9)<<"s winner_validate_cpu="<<(winner_cpu_ns.load()*1e-9)<<"s\n";
  lap("event_dedup_validate");
  auto validate_t1=chrono::steady_clock::now();
  size_t good_n=0,pending_n=0,pending_num_n=0;
