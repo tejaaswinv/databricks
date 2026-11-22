@@ -582,7 +582,10 @@ int main(){
   }
  }
  lap("event_parse");
- vector<vector<Cand>> unique(PARTS);
+ vector<vector<Evt>> valid_by_part(PARTS);
+ vector<vector<PendingEvt>> pending_by_part(PARTS);
+ vector<vector<PendingNum>> pending_num_by_part(PARTS);
+ auto validate_t0=chrono::steady_clock::now();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
 #endif
@@ -593,31 +596,19 @@ int main(){
   for(size_t t=0;t<workers;t++){
    auto& rows=raw[t*PARTS+part];
    for(const Cand& c:rows){
-      uint32_t ix=idx.get_or_create(c);
-      if(ix==UINT32_MAX)cands.push_back(c);
-      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
+    uint32_t ix=idx.get_or_create(c);
+    if(ix==UINT32_MAX)cands.push_back(c);
+    else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
    }
    vector<Cand>().swap(rows);
   }
-  unique[part]=move(cands);
- }
- vector<vector<Cand>>().swap(raw);lap("event_dedup");
- // Validate winners in parallel. The linked-ID table is immutable here, so its lookups
- // are thread-safe. Only IDs absent from links are deferred for sequential insertion.
- vector<vector<Evt>> valid_by_part(PARTS);
- vector<vector<PendingEvt>> pending_by_part(PARTS);
- vector<vector<PendingNum>> pending_num_by_part(PARTS);
- auto validate_t0=chrono::steady_clock::now();
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  auto& rows=unique[part];
+
   auto& good=valid_by_part[part];
-  auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
-  good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
+  auto& pending=pending_by_part[part];
+  auto& pending_num=pending_num_by_part[part];
+  good.reserve(cands.size());pending.reserve(32);pending_num.reserve(cands.size()/3+16);
   SV f[7];
-  for(const Cand& c:rows){
+  for(const Cand& c:cands){
    SV user,prod;uint8_t tp;uint32_t t,user_hash=0;uint64_t uk=UINT64_MAX;int32_t price=0;uint16_t cat=unknown;
    if((c.idtag&(NONCANON_ID|NONCOMPACT_PAYLOAD))==0){
     uk=cand_user_key(c);t=cand_time(c);tp=cand_type(c);price=cand_price(c);cat=cand_category(c);
@@ -643,10 +634,10 @@ int main(){
    else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
   }
-  vector<Cand>().swap(rows);
  }
- vector<vector<Cand>>().swap(unique);
+ vector<vector<Cand>>().swap(raw);
  auto validate_t1=chrono::steady_clock::now();
+ lap("event_dedup_validate");
  size_t good_n=0,pending_n=0,pending_num_n=0;
  for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();pending_num_n+=pending_num_by_part[part].size();}
  vector<Evt> events;events.reserve(good_n+pending_n+pending_num_n);
