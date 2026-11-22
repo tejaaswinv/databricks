@@ -655,6 +655,15 @@ int main(){
  PackedNumPeople numeric_people=std::move(dsu.numeric);
  numeric_people.remap(link_person);
  advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),true);
+ // Exact negative filter for event-time identity lookup. A clear bit proves that
+ // this canonical user ID was not present in the link graph; set bits still use
+ // the collision-safe PackedNumPeople lookup.
+ static constexpr size_t LINK_PRESENCE_BITS=1u<<24;
+ vector<uint64_t> link_presence(LINK_PRESENCE_BITS/64,0);
+ auto presence_bit=[](uint64_t k)->uint32_t{return (uint32_t)((k^(k>>23)^(k>>37))&(LINK_PRESENCE_BITS-1));};
+ for(size_t i=0;i<numeric_people.slots.size();i++)if(numeric_people.slots[i]){
+  uint32_t b=presence_bit(numeric_people.key_at(i));link_presence[b>>6]|=1ULL<<(b&63);
+ }
  for(uint32_t i:dsu.special_nodes)person_map.add_link(dsu.nodes[i].value,link_person[i]);
  dsu.buckets.clear();dsu.buckets.shrink_to_fit();
  cerr<<"subphase link_build="<<chrono::duration<double>(links_built-links_start).count()<<"s canonicalize="<<chrono::duration<double>(chrono::steady_clock::now()-links_built).count()<<"s\n";
@@ -795,7 +804,11 @@ int main(){
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
    }
-   uint32_t p=(uk!=UINT64_MAX)?cache.find(numeric_people,uk):person_map.find_hashed(user,user_hash);
+   uint32_t p;
+   if(uk!=UINT64_MAX){
+    uint32_t b=presence_bit(uk);
+    p=(link_presence[b>>6]&(1ULL<<(b&63)))?cache.find(numeric_people,uk):UINT32_MAX;
+   }else p=person_map.find_hashed(user,user_hash);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
