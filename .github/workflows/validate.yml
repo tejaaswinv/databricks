@@ -44,7 +44,7 @@ jobs:
           python3 starter-duckdb/scripts/compare.py out dev-answer
       - name: Paired practice-scale benchmark against the previous main
         env:
-          BASELINE_REF: ${{ inputs.baseline_ref || 'f33bbe4ac67593e25e13e4055ffe0b6993218b82' }}
+          BASELINE_REF: ${{ inputs.baseline_ref || '090de5ea95fb508b6735bde301841013ef5e3648' }}
         run: |
           lscpu
           generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output bench
