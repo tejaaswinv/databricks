@@ -662,7 +662,7 @@ int main(){
  FastPeople person_map(people,max<size_t>(2048,dsu.nodes.size()/32+128));
  PackedNumPeople numeric_people=std::move(dsu.numeric);
  numeric_people.remap(link_person);
- advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),true);
+ advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),false);
  for(uint32_t i:dsu.special_nodes)person_map.add_link(dsu.nodes[i].value,link_person[i]);
  dsu.buckets.clear();dsu.buckets.shrink_to_fit();
  cerr<<"subphase link_build="<<chrono::duration<double>(links_built-links_start).count()<<"s canonicalize="<<chrono::duration<double>(chrono::steady_clock::now()-links_built).count()<<"s\n";
