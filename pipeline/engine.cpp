@@ -692,7 +692,7 @@ int main(){
   }
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])chunks.push_back({bounds[j],bounds[j+1]});
  }
- constexpr size_t PARTS=256;
+ constexpr size_t PARTS=512;
  const size_t workers=max(1,ncpu);
  vector<vector<Cand>> raw(workers*PARTS);
  for(auto& v:raw)v.reserve((size_t)(event_capacity*1.04/workers/PARTS)+32);
@@ -933,7 +933,7 @@ int main(){
   for(size_t j=1;j<np;j++){const char* p=first+span*j/np;const char* q=(const char*)memchr(p,'\n',end-p);bounds[j]=q?q+1:end;}
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])click_chunks.push_back({bounds[j],bounds[j+1]});
  }
- constexpr size_t CPARTS=16;
+ constexpr size_t CPARTS=64;
  size_t click_est=max<size_t>(1000,events.size()/4);
  vector<IdentityCache> click_people_cache(workers);
  vector<vector<ClickCand>> click_raw(workers*CPARTS);
