@@ -1010,7 +1010,7 @@ int main(){
   while(at<events.size()&&events[at].person==events[at-1].person)at++;
   event_bounds[part]=at;
  }
- struct SessionCounts{size_t users=0,sessions=0,buys=0;};
+ struct SessionCounts{size_t users=0,sessions=0;};
  vector<SessionCounts> counts(session_parts+1);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
@@ -1025,29 +1025,40 @@ int main(){
     if(e.person!=previous||day!=last_day){count.users++;last_day=day;}
     count.sessions++;
    }
-   count.buys+=e.is_purchase;previous=e.person;last_time=e.t;
+   previous=e.person;last_time=e.t;
   }
   counts[part+1]=count;
  }
  for(size_t part=1;part<counts.size();part++){
   counts[part].users+=counts[part-1].users;
   counts[part].sessions+=counts[part-1].sessions;
-  counts[part].buys+=counts[part-1].buys;
  }
  vector<UserDay> ud(counts.back().users);
  vector<Session> sessions(counts.back().sessions);
- vector<Buy> buys(counts.back().buys);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<session_parts;part++){
-  size_t ui=counts[part].users,si=counts[part].sessions,bi=counts[part].buys;
+  size_t ui=counts[part].users,si=counts[part].sessions;
   uint32_t previous=UINT32_MAX,last_time=0;int32_t last_day=INT32_MIN;
+  vector<int64_t> category_totals(categories.size(),0);
+  auto finalize=[&](){
+   if(ui==counts[part].users)return;
+   uint16_t best=UINT16_MAX;int64_t amount=0;
+   for(uint16_t cat=0;cat<category_totals.size();cat++){
+    int64_t value=category_totals[cat];
+    if(value>amount||(value==amount&&value>0&&(best==UINT16_MAX||byte_less(categories[cat],categories[best])))){amount=value;best=cat;}
+   }
+   ud[ui-1].top_category=best;
+  };
   for(size_t i=event_bounds[part];i<event_bounds[part+1];i++){
    const Evt& e=events[i];
    if(e.person!=previous||uint64_t(e.t)-last_time>(uint64_t)GAP){
     int64_t start=ws+(int64_t)e.t;int32_t day=epoch_day(start);
-    if(e.person!=previous||day!=last_day){ud[ui++]={e.person,day};last_day=day;}
+    if(e.person!=previous||day!=last_day){
+     finalize();fill(category_totals.begin(),category_totals.end(),0);
+     ud[ui++]={e.person,day};last_day=day;
+    }
     ud[ui-1].sessions++;
     sessions[si++]={start,0,e.person,(uint32_t)(ui-1),organic,0,0};
    }
@@ -1055,22 +1066,14 @@ int main(){
    auto& session=sessions[si-1];auto& user=ud[ui-1];user.events++;
    if(e.is_purchase){
     session.purchased=1;session.revenue+=e.price;user.revenue+=e.price;
-    buys[bi++]={(uint32_t)(ui-1),e.category,e.price};
+    category_totals[e.category]+=e.price;
    }
   }
+  finalize();
  }
  vector<Evt>().swap(events);
  cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
- // Purchase category totals are per person-day, NOT per session, with byte-order ties.
- sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
- uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
- for(size_t i=0;i<buys.size();){size_t j=i+1;int64_t amt=buys[i].price;while(j<buys.size()&&buys[j].userday==buys[i].userday&&buys[j].category==buys[i].category)amt+=buys[j++].price;
-  if(buys[i].userday!=curr){curr=buys[i].userday;bestamt=-1;bestcat=UINT16_MAX;}
-  uint16_t cat=buys[i].category;
-  if(amt>bestamt||(amt==bestamt && (bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){bestamt=amt;bestcat=cat;ud[curr].top_category=cat;}
-  i=j;
- }
- vector<Buy>().swap(buys);lap("top_category");
+ lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
  order_clicks(clicks);lap("click_sort");
  // Whole-person work units keep attribution cursors and assist intervals local
