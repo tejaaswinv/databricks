@@ -574,26 +574,12 @@ static void radix64(vector<T>& a, Key key, int passes=4){
   a.swap(tmp);
  }
 }
-template<class T>
-static void dense_person_time_order(vector<T>& a,size_t people_count){
- if(a.size()<2)return;
- vector<uint32_t> bounds(people_count+1,0);
- for(const auto& x:a)bounds[x.person+1]++;
- for(size_t p=1;p<bounds.size();p++)bounds[p]+=bounds[p-1];
- vector<uint32_t> pos=bounds;
- vector<T> tmp(a.size());
- for(const auto& x:a)tmp[pos[x.person]++]=x;
- a.swap(tmp);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,256)
-#endif
- for(size_t p=0;p<people_count;p++){
-  size_t b=bounds[p],e=bounds[p+1];
-  if(e-b>1)sort(a.begin()+b,a.begin()+e,[](const T&x,const T&y){return x.t<y.t;});
- }
+static void order_events(vector<Evt>& es){
+ radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
-static void order_events(vector<Evt>& es,size_t people_count){dense_person_time_order(es,people_count);}
-static void order_clicks(vector<Click>& cs,size_t people_count){dense_person_time_order(cs,people_count);}
+static void order_clicks(vector<Click>& cs){
+ radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
+}
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
  const string out=getenv("OUTPUT_DIR")?getenv("OUTPUT_DIR"):"/output";
@@ -1014,7 +1000,7 @@ int main(){
  vector<vector<Click>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
  // Sessions from globally sorted valid events, across every linked ID.
- order_events(events,people.size());lap("event_bucket_order");
+ order_events(events);lap("event_sort");
  // Count output ranges first so independent groups of whole people can write
  // directly into final arrays. No locks or concatenation of session copies.
  size_t session_parts=min<size_t>(workers*4,max<size_t>(1,events.size()/65536));
@@ -1089,7 +1075,7 @@ int main(){
  cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
  lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
- order_clicks(clicks,people.size());lap("click_bucket_order");
+ order_clicks(clicks);lap("click_sort");
  // Whole-person work units keep attribution cursors and assist intervals local
  // to one worker. Aggregate into private campaign arrays, then reduce once.
  const int64_t click_base=ws-WEEK;
