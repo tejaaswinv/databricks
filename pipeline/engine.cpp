@@ -522,10 +522,10 @@ static int32_t parse_price(SV s) {
  return v>0?v:-1;
 }
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
-template<class T,class Key>
+template<unsigned BITS=16,class T,class Key>
 static void radix64(vector<T>& a, Key key, int passes=4){
  if(a.size()<2)return;
- constexpr size_t R=1u<<16, MASK=R-1;
+ constexpr size_t R=1u<<BITS, MASK=R-1;
  int nt=1;
 #ifdef _OPENMP
  nt=max(1,omp_get_max_threads());
@@ -535,7 +535,7 @@ static void radix64(vector<T>& a, Key key, int passes=4){
  vector<size_t> hist((size_t)nt*R), pos((size_t)nt*R);
  for(int pass=0;pass<passes;pass++){
   fill(hist.begin(),hist.end(),0);
-  unsigned shift=pass*16;
+  unsigned shift=pass*BITS;
   int active=nt;
 #ifdef _OPENMP
 #pragma omp parallel
@@ -574,11 +574,19 @@ static void radix64(vector<T>& a, Key key, int passes=4){
   a.swap(tmp);
  }
 }
-static void order_events(vector<Evt>& es){
- radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
+static void order_events(vector<Evt>& es,size_t person_count,int64_t window_ms){
+ // For the 14-day 20M workload the canonical person fits 20 bits and the
+ // event timestamp fits 31 bits. Three 17-bit LSD passes suffice exactly.
+ if(person_count<(1u<<20)&&window_ms<(1LL<<31))
+  radix64<17>(es,[](const Evt&e){return (uint64_t(e.person)<<31)|e.t;},3);
+ else
+  radix64<16>(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
-static void order_clicks(vector<Click>& cs){
- radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
+static void order_clicks(vector<Click>& cs,size_t person_count,int64_t click_window_ms){
+ if(person_count<(1u<<20)&&click_window_ms<(1LL<<31))
+  radix64<17>(cs,[](const Click&c){return (uint64_t(c.person)<<31)|c.t;},3);
+ else
+  radix64<16>(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
@@ -758,48 +766,39 @@ int main(){
 #endif
   auto& cache=event_people_cache[lookup_tid];
   size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
-  // Exact two-pass duplicate filter: the first pass marks hash *buckets*
-  // containing two or more candidates. Every genuinely repeated event ID
-  // necessarily lands in a marked bucket. False positives are harmless because
-  // the marked rows still pass through the collision-safe exact dedup index.
-  // Most one-off IDs bypass expensive random-access dedup entirely.
-  size_t filter_bits=64;
-  while(filter_bits<n*16)filter_bits*=2;
-  vector<uint64_t> filter_seen(filter_bits/64,0),filter_repeat(filter_bits/64,0);
-  const size_t mask=filter_bits-1;
-  auto fingerprint=[&](const Cand& c)->size_t{
-   uint64_t key=(c.idtag&~NONCOMPACT_PAYLOAD)>>countr_zero(PARTS);
-   key*=0x9e3779b97f4a7c15ULL;
-   key^=key>>32;
-   return (size_t)key&mask;
-  };
-  for(size_t t=0;t<workers;t++)for(const Cand& c:raw[t*PARTS+part]){
-   size_t i=fingerprint(c),word=i>>6;uint64_t bit=1ULL<<(i&63);
-   filter_repeat[word]|=filter_seen[word]&bit;
-   filter_seen[word]|=bit;
+  vector<Cand> cands;cands.reserve(n);
+  FlatEventIndex idx(cands,n,countr_zero(PARTS));
+  for(size_t t=0;t<workers;t++){
+   auto& rows=raw[t*PARTS+part];
+   for(const Cand& c:rows){
+      uint32_t ix=idx.get_or_create(c);
+      if(ix==UINT32_MAX)cands.push_back(c);
+      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
+   }
+   vector<Cand>().swap(rows);
   }
-
+  auto& rows=cands;
   auto& good=valid_by_part[part];
   auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
-  good.reserve(n);pending.reserve(32);pending_num.reserve(n/3+16);
+  good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
   SV f[7];
-  auto emit=[&](const Cand& c){
+  for(const Cand& c:rows){
    SV user,prod;uint8_t tp;uint32_t t,user_hash=0;uint64_t uk=UINT64_MAX;int32_t price=0;uint16_t cat=unknown;
    if((c.idtag&(NONCANON_ID|NONCOMPACT_PAYLOAD))==0){
     uk=cand_user_key(c);t=cand_time(c);tp=cand_type(c);price=cand_price(c);cat=cand_category(c);
-    if(cand_product_empty(c)||tp==3||t==0x7fffffffU)return;
-    if(cand_ingest_ms(c,ws)-(ws+(int64_t)t)>DAY)return;
-    if(tp==2&&price<=0)return;
+    if(cand_product_empty(c)||tp==3||t==0x7fffffffU)continue;
+    if(cand_ingest_ms(c,ws)-(ws+(int64_t)t)>DAY)continue;
+    if(tp==2&&price<=0)continue;
    }else{
-    SV fline=cand_line(c);if(!split_csv(fline,7,f))return;
+    SV fline=cand_line(c);if(!split_csv(fline,7,f))continue;
     user=f[1];prod=f[5];
     if(!canonical_base36_id(user,'u',uk))user_hash=(uint32_t)Hash{}(user);
     tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-    if(user.empty()||prod.empty()||tp==3)return;
-    int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||cand_ingest_ms(c,ws)-ts>DAY)return;
+    if(user.empty()||prod.empty()||tp==3)continue;
+    int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||cand_ingest_ms(c,ws)-ts>DAY)continue;
     t=(uint32_t)(ts-ws);
     if(tp==2){
-     price=parse_price(f[6]);if(price<=0)return;uint32_t pn;
+     price=parse_price(f[6]);if(price<=0)continue;uint32_t pn;
      if(product_number(prod,pn)&&pn<product_fast.size())cat=product_fast[pn]==UINT16_MAX?unknown:product_fast[pn];
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
@@ -808,24 +807,8 @@ int main(){
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
-  };
-  // Proven-unique candidates are validated immediately. Potential duplicates
-  // still go through exact earliest-ingest selection before validation.
-  vector<Cand> ambiguous;ambiguous.reserve(max<size_t>(16,n/8));
-  FlatEventIndex idx(ambiguous,max<size_t>(16,n/8),countr_zero(PARTS));
-  for(size_t t=0;t<workers;t++){
-   auto& src=raw[t*PARTS+part];
-   for(const Cand& c:src){
-    size_t i=fingerprint(c);
-    if(!(filter_repeat[i>>6]&(1ULL<<(i&63)))){emit(c);continue;}
-    uint32_t ix=idx.get_or_create(c);
-    if(ix==UINT32_MAX)ambiguous.push_back(c);
-    else if(cand_ingest_ms(c,ws)<cand_ingest_ms(ambiguous[ix],ws))ambiguous[ix]=c;
-   }
-   vector<Cand>().swap(src);
   }
-  for(const Cand& c:ambiguous)emit(c);
-  vector<Cand>().swap(ambiguous);
+  vector<Cand>().swap(rows);
  }
  vector<vector<Cand>>().swap(raw);
  lap("event_dedup_validate");
@@ -1025,7 +1008,7 @@ int main(){
  vector<vector<Click>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
  // Sessions from globally sorted valid events, across every linked ID.
- order_events(events);lap("event_sort");
+ order_events(events,people.size(),we-ws);lap("event_sort");
  // Count output ranges first so independent groups of whole people can write
  // directly into final arrays. No locks or concatenation of session copies.
  size_t session_parts=min<size_t>(workers*4,max<size_t>(1,events.size()/65536));
@@ -1100,7 +1083,7 @@ int main(){
  cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
  lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
- order_clicks(clicks);lap("click_sort");
+ order_clicks(clicks,people.size(),we-ws+WEEK);lap("click_sort");
  // Whole-person work units keep attribution cursors and assist intervals local
  // to one worker. Aggregate into private campaign arrays, then reduce once.
  const int64_t click_base=ws-WEEK;
