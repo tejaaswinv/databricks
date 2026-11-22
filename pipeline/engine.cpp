@@ -486,7 +486,7 @@ struct FlatEventIndex {
  }
 };
 struct FlatClickCandIndex {
- vector<uint32_t> buckets;
+ vector<uint64_t> buckets;
  vector<Click>& rows;
  vector<uint64_t>& tags;
  unsigned partition_bits;
@@ -494,15 +494,19 @@ struct FlatClickCandIndex {
   size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;buckets.resize(cap);
  }
  bool insert(const ClickCand& c){
-  size_t p=(size_t)(c.idtag>>partition_bits)&(buckets.size()-1);
+  const uint64_t key=c.idtag;
+  size_t p=(size_t)(key>>partition_bits)&(buckets.size()-1);
   while(buckets[p]){
-   size_t at=buckets[p]-1;
-   if(c.idtag==tags[at]){
-    if((c.idtag>>63)==0 || c.clickid==rows[at].clickid)return false;
+   uint64_t slot=buckets[p];
+   // Canonical click IDs are exact 40-bit values. Compare the key in the
+   // bucket first and only chase the separate tag/row arrays for rare dirty IDs.
+   if((slot&MASK40)==(key&MASK40)){
+    size_t at=(size_t)(slot>>40)-1;
+    if((key&NONCANON_ID)==0 || (key==tags[at] && c.clickid==rows[at].clickid))return false;
    }
    p=(p+1)&(buckets.size()-1);
   }
-  buckets[p]=(uint32_t)rows.size()+1;
+  buckets[p]=(uint64_t(rows.size()+1)<<40)|(key&MASK40);
   return true;
  }
 };
