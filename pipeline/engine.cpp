@@ -391,15 +391,51 @@ struct FastOut{
 template<class T,class Time>
 static vector<size_t> bucket_person_time(vector<T>& a,size_t person_count,Time time_key){
  vector<size_t> off(person_count+1,0);
- for(const T& x:a)off[(size_t)x.person+1]++;
- for(size_t i=1;i<off.size();i++)off[i]+=off[i-1];
+ if(a.empty())return off;
+ int nt=1;
+#ifdef _OPENMP
+ nt=max(1,omp_get_max_threads());
+#endif
+ // Thread-local histograms remove the serial global count and serial scatter passes.
+ vector<uint32_t> cnt((size_t)nt*person_count,0);
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+ {
+  int tid=0;
+#ifdef _OPENMP
+  tid=omp_get_thread_num();
+#endif
+  size_t lo=a.size()*(size_t)tid/nt,hi=a.size()*(size_t)(tid+1)/nt;
+  uint32_t* c=cnt.data()+(size_t)tid*person_count;
+  for(size_t i=lo;i<hi;i++)c[a[i].person]++;
+ }
+ for(size_t p=0;p<person_count;p++){
+  size_t total=0;for(int t=0;t<nt;t++)total+=cnt[(size_t)t*person_count+p];
+  off[p+1]=off[p]+total;
+ }
  if(a.size()>1){
-  vector<size_t> pos=off;
+  vector<size_t> starts((size_t)nt*person_count);
+  for(size_t p=0;p<person_count;p++){
+   size_t pos=off[p];
+   for(int t=0;t<nt;t++){starts[(size_t)t*person_count+p]=pos;pos+=cnt[(size_t)t*person_count+p];}
+  }
   vector<T> tmp(a.size());
-  for(const T& x:a)tmp[pos[x.person]++]=x;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+   int tid=0;
+#ifdef _OPENMP
+   tid=omp_get_thread_num();
+#endif
+   size_t lo=a.size()*(size_t)tid/nt,hi=a.size()*(size_t)(tid+1)/nt;
+   size_t* pos=starts.data()+(size_t)tid*person_count;
+   for(size_t i=lo;i<hi;i++)tmp[pos[a[i].person]++]=a[i];
+  }
   a.swap(tmp);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic,256)
 #endif
   for(size_t p=0;p<person_count;p++){
    size_t lo=off[p],hi=off[p+1],n=hi-lo;
