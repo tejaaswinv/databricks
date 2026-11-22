@@ -653,16 +653,45 @@ int main(){
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
  deque<string> owned_user_names;
- for(auto&src:pending_num_by_part){
+ // Resolve canonical standalone users in parallel with exact numeric shards.
+ // numeric_people is immutable during this phase; only genuinely missing keys enter shards.
+ constexpr size_t NUM_SHARDS=256;
+ array<unordered_map<uint64_t,uint32_t>,NUM_SHARDS> num_standalone;
+ array<mutex,NUM_SHARDS> num_mu;
+ size_t num_per=max<size_t>(16,pending_num_n/16/NUM_SHARDS+8);
+ for(auto& m:num_standalone)m.reserve(num_per);
+ uint32_t num_base=(uint32_t)people.size();
+ people.resize((size_t)num_base+pending_num_n);
+ vector<uint64_t> new_num_keys(pending_num_n,UINT64_MAX);
+ atomic<uint32_t> next_num(num_base);
+ vector<vector<Evt>> resolved_num(PARTS);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+ for(size_t part=0;part<PARTS;part++){
+  auto&src=pending_num_by_part[part];auto&dst=resolved_num[part];dst.reserve(src.size());
   for(const PendingNum&e:src){
    uint32_t p=numeric_people.find(e.key);
    if(p==UINT32_MAX){
-    p=(uint32_t)people.size();owned_user_names.push_back(canonical_user_name(e.key));people.push_back(owned_user_names.back());numeric_people.add(e.key,p);
+    size_t sh=FlatNumPeople::h(e.key+1)&(NUM_SHARDS-1);
+    lock_guard<mutex> lock(num_mu[sh]);
+    auto&m=num_standalone[sh];auto it=m.find(e.key);
+    if(it==m.end()){
+     p=next_num.fetch_add(1,memory_order_relaxed);m.emplace(e.key,p);new_num_keys[p-num_base]=e.key;
+    }else p=it->second;
    }
-   events.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
+   dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
   }
   vector<PendingNum>().swap(src);
  }
+ uint32_t num_final=next_num.load(memory_order_relaxed);
+ people.resize(num_final);
+ for(uint32_t p=num_base;p<num_final;p++){
+  uint64_t key=new_num_keys[p-num_base];
+  owned_user_names.push_back(canonical_user_name(key));people[p]=owned_user_names.back();numeric_people.add(key,p);
+ }
+ for(auto&v:resolved_num){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
+ vector<vector<Evt>>().swap(resolved_num);
  vector<vector<PendingNum>>().swap(pending_num_by_part);
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
  // so assignment order is irrelevant; every equal byte string still gets exactly one person.
