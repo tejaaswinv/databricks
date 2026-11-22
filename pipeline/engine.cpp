@@ -433,7 +433,7 @@ struct FlatEventIndex {
  vector<Cand>& rows;
  unsigned partition_bits;
  explicit FlatEventIndex(vector<Cand>& v,size_t expected,unsigned bits,bool force_wide=false):rows(v),partition_bits(bits){
-  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
+  size_t cap=16;while(cap<expected*2+16)cap*=2;
   if(expected<0xffffffU&&!force_wide)packed.resize(cap);else wide.resize(cap);
  }
  void widen(){
@@ -444,7 +444,7 @@ struct FlatEventIndex {
  uint32_t get_or_create(const Cand& c){
   if(!packed.empty()&&rows.size()>=0xffffffU)widen();
   size_t capacity=packed.empty()?wide.size():packed.size();
-  if(used*10>=capacity*7){grow();capacity=packed.empty()?wide.size():packed.size();}
+  if(used*2>=capacity){grow();capacity=packed.empty()?wide.size():packed.size();}
   uint64_t key=c.idtag&~NONCOMPACT_PAYLOAD;size_t mask=capacity-1,p=(size_t)(key>>partition_bits)&mask;
   if(!packed.empty()){
    for(;;){
