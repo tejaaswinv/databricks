@@ -498,15 +498,20 @@ struct FlatClickCandIndex {
   size_t p=(size_t)(key>>partition_bits)&(buckets.size()-1);
   while(buckets[p]){
    uint64_t slot=buckets[p];
-   // Canonical click IDs are exact 40-bit values. Compare the key in the
-   // bucket first and only chase the separate tag/row arrays for rare dirty IDs.
+   // bit63 records whether the stored key is a dirty/noncanonical hash.
+   // The remaining 23 high bits are ample for a per-shard winner index.
+   bool old_dirty=(slot>>63)!=0;
    if((slot&MASK40)==(key&MASK40)){
-    size_t at=(size_t)(slot>>40)-1;
-    if((key&NONCANON_ID)==0 || (key==tags[at] && c.clickid==rows[at].clickid))return false;
+    size_t at=(size_t)((slot>>40)&0x7fffffULL)-1;
+    bool new_dirty=(key&NONCANON_ID)!=0;
+    if(!old_dirty&&!new_dirty)return false;
+    if(old_dirty==new_dirty && key==tags[at] && c.clickid==rows[at].clickid)return false;
    }
    p=(p+1)&(buckets.size()-1);
   }
-  buckets[p]=(uint64_t(rows.size()+1)<<40)|(key&MASK40);
+  uint64_t index=(uint64_t(rows.size()+1)&0x7fffffULL)<<40;
+  uint64_t dirty=(key&NONCANON_ID)?(1ULL<<63):0;
+  buckets[p]=dirty|index|(key&MASK40);
   return true;
  }
 };
