@@ -1,7 +1,7 @@
 name: Validate shopping sessions
 on:
   push:
-    branches: [main, shard-optimize]
+    branches: [main, schedule-optimize]
   workflow_dispatch:
     inputs:
       baseline_ref:
@@ -44,7 +44,7 @@ jobs:
           python3 starter-duckdb/scripts/compare.py out dev-answer
       - name: Paired practice-scale benchmark against the previous main
         env:
-          BASELINE_REF: ${{ inputs.baseline_ref || 'a63db8473a548350b97962047a050c42f272a236' }}
+          BASELINE_REF: ${{ inputs.baseline_ref || '0340f0e98960b3eabcac749aa2fc6e6bd4648391' }}
         run: |
           lscpu
           generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output bench
