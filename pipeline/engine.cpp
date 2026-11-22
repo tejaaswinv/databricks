@@ -749,7 +749,7 @@ int main(){
  vector<vector<PendingNum>> pending_num_by_part(PARTS);
  auto validate_t0=chrono::steady_clock::now();
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
+#pragma omp parallel for schedule(static)
 #endif
  for(size_t part=0;part<PARTS;part++){
   size_t lookup_tid=0;
@@ -970,7 +970,7 @@ int main(){
  }
  vector<vector<Click>> click_unique(CPARTS);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
+#pragma omp parallel for schedule(static)
 #endif
  for(size_t part=0;part<CPARTS;part++){
   size_t n=0;for(size_t t=0;t<workers;t++)n+=click_raw[t*CPARTS+part].size();
