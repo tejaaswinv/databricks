@@ -61,6 +61,11 @@ static void id_tests(){
  check(map.find(0)==0&&map.find(MASK40)==0xfffffeU&&map.find(37)==0xffffffU,"wide identity promotion");
  for(uint64_t i=1;i<5000;i++)map.add(i,uint32_t(i));
  check(map.find(0)==0&&map.find(MASK40)==0xfffffeU&&map.find(4999)==4999,"wide identity rehash");
+ IdentityCache cache;
+ for(size_t i=0;i<100000;i++){
+  uint64_t key=rng()%8192;
+  check(cache.find(map,key)==map.find(key),"cached identity differs");
+ }
 }
 static void time_tests(){
  int64_t ts=0;
@@ -125,4 +130,33 @@ static void linked_identity_tests(){
  check(names(parallel)==expected,"parallel linked components differ");
  check(parallel.numeric.used+parallel.special_nodes.size()==parallel.nodes.size(),"linked index occupancy differs");
 }
-int main(){csv_tests();id_tests();time_tests();radix_tests();linked_identity_tests();std::cout<<"parser, identity, timestamp and radix checks passed\n";}
+static void event_index_tests(){
+ std::mt19937_64 rng(64);
+ vector<Cand> input;
+ for(size_t i=0;i<20000;i++){
+  uint64_t key=(rng()%5000)*256+17;
+  input.push_back({0,0,key|(i%2?NONCOMPACT_PAYLOAD:0)});
+ }
+ deque<string> lines;
+ for(auto id:{"Event-A","Event-B","Event-A"}){
+  lines.push_back(string(id)+",u1,0,1970-01-01T00:00:00Z,view,p1,");
+  // Deliberately force distinct string IDs to have the same complete hash,
+  // and the same short key as one of the canonical numeric IDs.
+  input.push_back({uint64_t(uintptr_t(lines.back().data())),lines.back().size(),NONCANON_ID|17});
+ }
+ std::rotate(input.begin(),input.end()-3,input.end());
+ for(bool force_wide:{false,true}){
+  vector<Cand> rows;FlatEventIndex index(rows,1,8,force_wide);
+  unordered_map<string,uint32_t> expected;
+  for(size_t i=0;i<input.size();i++){
+   const auto& c=input[i];
+   string key=c.idtag&NONCANON_ID?"string:"+string(cand_eventid(c)):"number:"+to_string(c.idtag&~NONCOMPACT_PAYLOAD);
+   auto [it,added]=expected.emplace(key,(uint32_t)rows.size());
+   uint32_t found=index.get_or_create(c);
+   check(added?found==UINT32_MAX:found==it->second,"event index collision handling differs");
+   if(added)rows.push_back(c);
+   if(!force_wide&&i==1000)index.widen();
+  }
+ }
+}
+int main(){csv_tests();id_tests();time_tests();radix_tests();linked_identity_tests();event_index_tests();std::cout<<"parser, identity, timestamp and radix checks passed\n";}

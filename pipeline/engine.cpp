@@ -88,6 +88,12 @@ static bool parse_time(SV s,int64_t &val,const char* known_date=nullptr,int32_t 
  if((s.size()!=20 && s.size()!=25)||s[4]!='-'){
   if(s.empty())return false;
   uint64_t n=0;
+  if(s.size()<=18){
+   // Eighteen decimal digits always fit int64_t. Only longer inputs need a
+   // per-digit overflow check (including arbitrarily many leading zeroes).
+   for(unsigned char ch:s){if(ch<'0'||ch>'9')return false;n=n*10+(ch-'0');}
+   val=(int64_t)n;return true;
+  }
   for(unsigned char ch:s){
    if(ch<'0'||ch>'9')return false;
    unsigned d=ch-'0';if(n>(uint64_t(INT64_MAX)-d)/10)return false;n=n*10+d;
@@ -157,6 +163,20 @@ template<class F>static void foreach_csv(const Mapping&m,int n,F action){
   if(exactcsv::next(p,end,n,fields))action(fields);
  }
 }
+static void advise_huge_pages(void* pointer,size_t bytes,bool collapse=false){
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+ if(bytes<(4u<<20))return;
+ long native_page=sysconf(_SC_PAGESIZE);if(native_page<=0)return;
+ size_t page=(size_t)native_page;
+ uintptr_t begin=(uintptr_t)pointer,end=begin+bytes;
+ begin=(begin+page-1)/page*page;end=end/page*page;
+ if(begin>=end)return;
+ madvise((void*)begin,end-begin,MADV_HUGEPAGE);
+#ifdef MADV_COLLAPSE
+ if(collapse)madvise((void*)begin,end-begin,MADV_COLLAPSE);
+#endif
+#endif
+}
 // Canonical 40-bit IDs and small internal indexes share one cache-line-friendly
 // slot. Larger indexes transparently switch to separate full-width values.
 struct PackedNumPeople {
@@ -201,6 +221,18 @@ struct PackedNumPeople {
 #pragma omp parallel for if(slots.size()>65536)
 #endif
   for(size_t i=0;i<slots.size();i++)if(slots[i])set_at(i,key_at(i),values[value_at(i)]);
+ }
+};
+// This cache is scoped to a phase with an immutable identity index. Separate
+// instances after standalone interning prevent stale negative click lookups.
+struct IdentityCache {
+ static constexpr size_t SIZE=2048;
+ array<uint64_t,SIZE> keys{};
+ array<uint32_t,SIZE> values{};
+ uint32_t find(const PackedNumPeople& index,uint64_t key){
+  size_t slot=key&(SIZE-1);uint64_t stored=key+1;
+  if(keys[slot]==stored)return values[slot];
+  uint32_t value=index.find(key);keys[slot]=stored;values[slot]=value;return value;
  }
 };
 struct Node{int parent,weight;SV value;};
@@ -395,42 +427,62 @@ struct FastPeople {
  }
 };
 struct FlatEventIndex {
- vector<uint32_t> buckets;
- size_t used = 0;
+ vector<uint64_t> packed;
+ vector<uint32_t> wide;
+ size_t used=0;
  vector<Cand>& rows;
  unsigned partition_bits;
- explicit FlatEventIndex(vector<Cand>& v,size_t expected,unsigned bits):rows(v),partition_bits(bits) {
-   size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
-   buckets.assign(cap,0);
+ explicit FlatEventIndex(vector<Cand>& v,size_t expected,unsigned bits,bool force_wide=false):rows(v),partition_bits(bits){
+  size_t cap=16;while(cap<(size_t)(expected/0.70)+16)cap*=2;
+  if(expected<0xffffffU&&!force_wide)packed.resize(cap);else wide.resize(cap);
  }
- uint32_t get_or_create(const Cand& c) {
-   if(used*10>=buckets.size()*7)grow();
-   size_t mask=buckets.size()-1;
-   uint64_t ckey=c.idtag&~NONCOMPACT_PAYLOAD;
-   size_t p=(size_t)(ckey>>partition_bits)&mask;
-   for(;;) {
-     uint32_t v=buckets[p];
-     if(!v) {
-       uint32_t id=(uint32_t)rows.size();
-       buckets[p]=id+1;used++;
-       return UINT32_MAX;
-     }
-     const Cand& old=rows[v-1];uint64_t okey=old.idtag&~NONCOMPACT_PAYLOAD;
-     if(ckey==okey){
-      if((ckey&NONCANON_ID)==0 || cand_eventid(c)==cand_eventid(old))return v-1;
-     }
-     p=(p+1)&mask;
-   }
+ void widen(){
+  wide.resize(packed.size());
+  for(size_t i=0;i<packed.size();i++)wide[i]=uint32_t(packed[i]>>40);
+  vector<uint64_t>().swap(packed);
  }
- void grow() {
-   vector<uint32_t> nb(buckets.size()*2,0);
-   size_t mask=nb.size()-1;
-   for(uint32_t v:buckets) if(v) {
-     size_t p=(size_t)((rows[v-1].idtag&~NONCOMPACT_PAYLOAD)>>partition_bits)&mask;
-     while(nb[p])p=(p+1)&mask;
-     nb[p]=v;
+ uint32_t get_or_create(const Cand& c){
+  if(!packed.empty()&&rows.size()>=0xffffffU)widen();
+  size_t capacity=packed.empty()?wide.size():packed.size();
+  if(used*10>=capacity*7){grow();capacity=packed.empty()?wide.size():packed.size();}
+  uint64_t key=c.idtag&~NONCOMPACT_PAYLOAD;size_t mask=capacity-1,p=(size_t)(key>>partition_bits)&mask;
+  if(!packed.empty()){
+   for(;;){
+    uint64_t slot=packed[p];
+    if(!slot){packed[p]=(uint64_t(rows.size()+1)<<40)|(key&MASK40);used++;return UINT32_MAX;}
+    // Keep the key beside the row index. Ordinary hash collisions no longer
+    // fetch a random candidate cache line just to inspect its event ID.
+    if((slot&MASK40)==(key&MASK40)){
+     uint32_t at=uint32_t(slot>>40)-1;const auto& old=rows[at];
+     if(key==(old.idtag&~NONCOMPACT_PAYLOAD)&&((key&NONCANON_ID)==0||cand_eventid(c)==cand_eventid(old)))return at;
+    }
+    p=(p+1)&mask;
    }
-   buckets.swap(nb);
+  }
+  for(;;){
+   uint32_t value=wide[p];
+   if(!value){wide[p]=(uint32_t)rows.size()+1;used++;return UINT32_MAX;}
+   const auto& old=rows[value-1];
+   if(key==(old.idtag&~NONCOMPACT_PAYLOAD)&&((key&NONCANON_ID)==0||cand_eventid(c)==cand_eventid(old)))return value-1;
+   p=(p+1)&mask;
+  }
+ }
+ void grow(){
+  if(!packed.empty()){
+   vector<uint64_t> bigger(packed.size()*2);size_t mask=bigger.size()-1;
+   for(uint64_t slot:packed)if(slot){
+    uint32_t at=uint32_t(slot>>40)-1;size_t p=(size_t)((rows[at].idtag&~NONCOMPACT_PAYLOAD)>>partition_bits)&mask;
+    while(bigger[p])p=(p+1)&mask;bigger[p]=slot;
+   }
+   packed.swap(bigger);
+  }else{
+   vector<uint32_t> bigger(wide.size()*2);size_t mask=bigger.size()-1;
+   for(uint32_t value:wide)if(value){
+    size_t p=(size_t)((rows[value-1].idtag&~NONCOMPACT_PAYLOAD)>>partition_bits)&mask;
+    while(bigger[p])p=(p+1)&mask;bigger[p]=value;
+   }
+   wide.swap(bigger);
+  }
  }
 };
 struct FlatClickCandIndex {
@@ -464,9 +516,9 @@ static int64_t parse_ingest(SV s,int32_t& day){
  return (day*86400LL+h*3600+mi*60+se)*1000;
 }
 static int32_t parse_price(SV s) {
- if(!digits(s))return -1;
+ if(s.empty())return -1;
  int32_t v=0;
- for(char c:s){v=v*10+(c-'0');if(v>10000000)return -1;}
+ for(unsigned char c:s){if(c<'0'||c>'9')return -1;v=v*10+(c-'0');if(v>10000000)return -1;}
  return v>0?v:-1;
 }
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
@@ -602,6 +654,7 @@ int main(){
  FastPeople person_map(people,max<size_t>(2048,dsu.nodes.size()/32+128));
  PackedNumPeople numeric_people=std::move(dsu.numeric);
  numeric_people.remap(link_person);
+ advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),true);
  for(uint32_t i:dsu.special_nodes)person_map.add_link(dsu.nodes[i].value,link_person[i]);
  dsu.buckets.clear();dsu.buckets.shrink_to_fit();
  cerr<<"subphase link_build="<<chrono::duration<double>(links_built-links_start).count()<<"s canonicalize="<<chrono::duration<double>(chrono::steady_clock::now()-links_built).count()<<"s\n";
@@ -690,6 +743,7 @@ int main(){
   }
  }
  lap("event_parse");
+ vector<IdentityCache> event_people_cache(workers);
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
  vector<vector<PendingNum>> pending_num_by_part(PARTS);
@@ -698,6 +752,11 @@ int main(){
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<PARTS;part++){
+  size_t lookup_tid=0;
+#ifdef _OPENMP
+  lookup_tid=(size_t)omp_get_thread_num();
+#endif
+  auto& cache=event_people_cache[lookup_tid];
   size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
   vector<Cand> cands;cands.reserve(n);
   FlatEventIndex idx(cands,n,countr_zero(PARTS));
@@ -736,7 +795,7 @@ int main(){
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
    }
-   uint32_t p=(uk!=UINT64_MAX)?numeric_people.find(uk):person_map.find_hashed(user,user_hash);
+   uint32_t p=(uk!=UINT64_MAX)?cache.find(numeric_people,uk):person_map.find_hashed(user,user_hash);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
@@ -876,6 +935,7 @@ int main(){
  }
  constexpr size_t CPARTS=16;
  size_t click_est=max<size_t>(1000,events.size()/4);
+ vector<IdentityCache> click_people_cache(workers);
  vector<vector<ClickCand>> click_raw(workers*CPARTS);
  for(auto&v:click_raw)v.reserve(click_est/workers/CPARTS+16);
 #ifdef _OPENMP
@@ -897,7 +957,7 @@ int main(){
       if(canonical_base36_id(f[0],'k',n))tag=n;
       else tag=(1ULL<<63)|(uint64_t(Hash{}(f[0]))&0x7fffffffffffffffULL);
       uint64_t uk;uint32_t person;
-      if(canonical_base36_id(f[1],'u',uk))person=numeric_people.find(uk);
+      if(canonical_base36_id(f[1],'u',uk))person=click_people_cache[tid].find(numeric_people,uk);
       else {size_t uh=Hash{}(f[1]);person=person_map.find_hashed(f[1],uh);}
       // A click for a person with no surviving event can affect neither table.
       // Dropping it also avoids interning identities that can never have a session.

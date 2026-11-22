@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline commit for the paired benchmark
+        required: true
+        default: 8d7ff0560673f0ce4c9152b044ee52effb0eaed7
 
 jobs:
   validate:
@@ -42,9 +47,12 @@ jobs:
           IMAGE=shopping-sessions:latest CPUS=4 MEM=7g sh starter-duckdb/scripts/docker_run.sh dev out
           python3 starter-duckdb/scripts/compare.py out dev-answer
       - name: Paired practice-scale benchmark against the previous main
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref || '8d7ff0560673f0ce4c9152b044ee52effb0eaed7' }}
         run: |
+          lscpu
           generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output bench
-          git worktree add --detach /tmp/baseline 8d7ff0560673f0ce4c9152b044ee52effb0eaed7
+          git worktree add --detach /tmp/baseline "$BASELINE_REF"
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
           python3 scripts/benchmark.py --data bench --output benchmark-results \
             --image shopping-sessions:latest --baseline-image shopping-sessions:baseline \
