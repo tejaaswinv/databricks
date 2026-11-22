@@ -225,6 +225,50 @@ struct PackedNumPeople {
 };
 // This cache is scoped to a phase with an immutable identity index. Separate
 // instances after standalone interning prevent stale negative click lookups.
+struct ConcurrentNumPeople {
+ static constexpr uint32_t CLAIM=0xffffffu;
+ unique_ptr<atomic<uint64_t>[]> slots;
+ size_t cap=0,mask=0;
+ explicit ConcurrentNumPeople(size_t expected){
+  cap=16;while(cap<expected*2+16)cap<<=1;mask=cap-1;
+  slots=make_unique<atomic<uint64_t>[]>(cap);
+  for(size_t i=0;i<cap;i++)slots[i].store(0,memory_order_relaxed);
+ }
+ uint32_t get_or_add(uint64_t key,atomic<uint32_t>& next){
+  size_t p=(size_t)PackedNumPeople::hash_key(key)&mask;
+  for(;;){
+   uint64_t slot=slots[p].load(memory_order_acquire);
+   if(!slot){
+    uint64_t claim=(uint64_t(CLAIM)<<40)|(key&MASK40),expected=0;
+    if(slots[p].compare_exchange_strong(expected,claim,memory_order_acq_rel,memory_order_acquire)){
+     uint32_t person=next.fetch_add(1,memory_order_relaxed);
+     if(person+1>=CLAIM)fail("too many people");
+     slots[p].store((uint64_t(person+1)<<40)|(key&MASK40),memory_order_release);
+     return person;
+    }
+    slot=expected;
+   }
+   if((slot&MASK40)==(key&MASK40)){
+    uint32_t value=(uint32_t)(slot>>40);
+    while(value==CLAIM){
+#if defined(__x86_64__)
+     __builtin_ia32_pause();
+#endif
+     slot=slots[p].load(memory_order_acquire);value=(uint32_t)(slot>>40);
+    }
+    return value-1;
+   }
+   p=(p+1)&mask;
+  }
+ }
+ template<class F>void each(F fn)const{
+  for(size_t i=0;i<cap;i++){
+   uint64_t slot=slots[i].load(memory_order_relaxed);
+   uint32_t value=(uint32_t)(slot>>40);
+   if(value&&value!=CLAIM)fn(slot&MASK40,value-1);
+  }
+ }
+};
 struct IdentityCache {
  static constexpr size_t SIZE=2048;
  array<uint64_t,SIZE> keys{};
@@ -744,9 +788,11 @@ int main(){
  }
  lap("event_parse");
  vector<IdentityCache> event_people_cache(workers);
+ uint32_t numeric_base=(uint32_t)people.size();
+ atomic<uint32_t> next_numeric(numeric_base);
+ ConcurrentNumPeople standalone_numeric(max<size_t>(1024,event_capacity/24));
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
- vector<vector<PendingNum>> pending_num_by_part(PARTS);
  auto validate_t0=chrono::steady_clock::now();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -771,8 +817,8 @@ int main(){
   }
   auto& rows=cands;
   auto& good=valid_by_part[part];
-  auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
-  good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
+  auto& pending=pending_by_part[part];
+  good.reserve(rows.size());pending.reserve(32);
   SV f[7];
   for(const Cand& c:rows){
    SV user,prod;uint8_t tp;uint32_t t,user_hash=0;uint64_t uk=UINT64_MAX;int32_t price=0;uint16_t cat=unknown;
@@ -796,8 +842,8 @@ int main(){
     }
    }
    uint32_t p=(uk!=UINT64_MAX)?cache.find(numeric_people,uk):person_map.find_hashed(user,user_hash);
+   if(p==UINT32_MAX&&uk!=UINT64_MAX)p=standalone_numeric.get_or_add(uk,next_numeric);
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
-   else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
   }
   vector<Cand>().swap(rows);
@@ -805,73 +851,22 @@ int main(){
  vector<vector<Cand>>().swap(raw);
  lap("event_dedup_validate");
  auto validate_t1=chrono::steady_clock::now();
- size_t good_n=0,pending_n=0,pending_num_n=0;
- for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();pending_num_n+=pending_num_by_part[part].size();}
- vector<Evt> events;events.reserve(good_n+pending_n+pending_num_n);
+ size_t good_n=0,pending_n=0;
+ for(size_t part=0;part<PARTS;part++){good_n+=valid_by_part[part].size();pending_n+=pending_by_part[part].size();}
+ vector<Evt> events;events.reserve(good_n+pending_n);
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
- // Partition unresolved numeric identities once, then intern each shard without
- // locks. Repeated events no longer revisit one large mutable identity table.
- constexpr size_t NUM_SHARDS=256;
- vector<size_t> numeric_counts(PARTS*NUM_SHARDS),numeric_offsets(PARTS*NUM_SHARDS);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  auto* counts=numeric_counts.data()+part*NUM_SHARDS;
-  for(const auto& e:pending_num_by_part[part])counts[e.key&(NUM_SHARDS-1)]++;
- }
- array<size_t,NUM_SHARDS+1> numeric_bounds{};
- size_t numeric_at=0;
- for(size_t sh=0;sh<NUM_SHARDS;sh++){
-  numeric_bounds[sh]=numeric_at;
-  for(size_t part=0;part<PARTS;part++){
-   numeric_offsets[part*NUM_SHARDS+sh]=numeric_at;
-   numeric_at+=numeric_counts[part*NUM_SHARDS+sh];
-  }
- }
- numeric_bounds[NUM_SHARDS]=numeric_at;
- vector<PendingNum> numeric_rows(pending_num_n);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  auto* positions=numeric_offsets.data()+part*NUM_SHARDS;
-  for(const auto& e:pending_num_by_part[part])numeric_rows[positions[e.key&(NUM_SHARDS-1)]++]=e;
-  vector<PendingNum>().swap(pending_num_by_part[part]);
- }
- vector<vector<PendingNum>>().swap(pending_num_by_part);
- array<deque<string>,NUM_SHARDS> owned_user_names;
- array<vector<pair<uint64_t,uint32_t>>,NUM_SHARDS> new_numeric;
- uint32_t numeric_base=(uint32_t)people.size();
- people.resize((size_t)numeric_base+pending_num_n);
- events.resize(good_n+pending_num_n);
- atomic<uint32_t> next_numeric(numeric_base);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
-#endif
- for(size_t sh=0;sh<NUM_SHARDS;sh++){
-  size_t first=numeric_bounds[sh],last=numeric_bounds[sh+1];
-  if(first==last)continue;
-  PackedNumPeople local(max<size_t>(16,(last-first)/24));
-  auto& names=owned_user_names[sh];auto& identities=new_numeric[sh];
-  for(size_t i=first;i<last;i++){
-   const auto& e=numeric_rows[i];
-   // All keys in a shard share eight low bits. Remove those bits in the
-   // private table too, while retaining the complete ID in the global index.
-   uint64_t local_key=e.key/NUM_SHARDS;
-   uint32_t p=local.find(local_key);
-   if(p==UINT32_MAX){
-    p=next_numeric.fetch_add(1,memory_order_relaxed);
-    names.push_back(canonical_user_name(e.key));people[p]=names.back();
-    local.add(local_key,p);identities.push_back({e.key,p});
-   }
-   events[good_n+i]={e.t,p,e.price,e.category,e.is_purchase,0};
-  }
- }
- people.resize(next_numeric.load(memory_order_relaxed));
- for(const auto& identities:new_numeric)for(const auto& [key,p]:identities)numeric_people.add(key,p);
- vector<PendingNum>().swap(numeric_rows);
+ // Canonical standalone IDs were assigned during winner validation. Materialize
+ // only the unique identities once and register them for click lookup.
+ uint32_t numeric_final=next_numeric.load(memory_order_relaxed);
+ people.resize(numeric_final);
+ deque<string> owned_numeric_names;
+ owned_numeric_names.resize(0);
+ standalone_numeric.each([&](uint64_t key,uint32_t p){
+  owned_numeric_names.push_back(canonical_user_name(key));
+  people[p]=owned_numeric_names.back();
+  numeric_people.add(key,p);
+ });
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
  // so assignment order is irrelevant; every equal byte string still gets exactly one person.
  constexpr size_t ID_SHARDS=256;
@@ -917,7 +912,7 @@ int main(){
  vector<vector<PendingEvt>>().swap(pending_by_part);
  auto validate_t2=chrono::steady_clock::now();
  cerr<<"subphase winner_validate="<<chrono::duration<double>(validate_t1-validate_t0).count()<<"s standalone_resolve="<<chrono::duration<double>(validate_t2-validate_t1).count()<<"s\n";
- cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<(pending_n+pending_num_n)<<"\n";lap("identity_resolve");
+ cerr<<"valid events="<<events.size()<<" people="<<people.size()<<" pending_ids_rows="<<pending_n<<"\n";lap("identity_resolve");
  // Clicks: parse + validate in parallel, then exact-dedup independent ID shards.
  auto click_paths=input_files(data+"/clicks");
  vector<Work> click_chunks;
