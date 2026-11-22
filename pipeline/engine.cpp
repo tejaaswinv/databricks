@@ -283,6 +283,20 @@ struct FlatNumPeople{
   keys[p]=stored;vals[p]=person;used++;
  }
 };
+static inline uint64_t cand_event_key(const Cand& c){return c.idtag&~(NONCOMPACT_PAYLOAD|NONCANON_ID);}
+static void radix_cands(vector<Cand>& a){
+ if(a.size()<2)return;
+ vector<Cand> tmp(a.size());
+ vector<uint32_t> cnt(1u<<16);
+ for(unsigned pass=0;pass<3;pass++){
+  fill(cnt.begin(),cnt.end(),0);
+  unsigned shift=pass*16;
+  for(const Cand& c:a)cnt[(cand_event_key(c)>>shift)&0xffffu]++;
+  uint32_t sum=0;for(size_t i=0;i<cnt.size();i++){uint32_t n=cnt[i];cnt[i]=sum;sum+=n;}
+  for(const Cand& c:a)tmp[cnt[(cand_event_key(c)>>shift)&0xffffu]++]=c;
+  a.swap(tmp);
+ }
+}
 struct FlatEventIndex {
  vector<uint32_t> buckets;
  size_t used = 0;
@@ -588,18 +602,41 @@ int main(){
 #endif
  for(size_t part=0;part<PARTS;part++){
   size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
-  vector<Cand> cands;cands.reserve(n);
-  FlatEventIndex idx(cands,n);
+  vector<Cand> canonical,fallback;
+  canonical.reserve(n*7/8+32);fallback.reserve(n/8+32);
   for(size_t t=0;t<workers;t++){
    auto& rows=raw[t*PARTS+part];
    for(const Cand& c:rows){
-      uint32_t ix=idx.get_or_create(c);
-      if(ix==UINT32_MAX)cands.push_back(c);
-      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
+    if((c.idtag&NONCANON_ID)==0)canonical.push_back(c);
+    else fallback.push_back(c);
    }
    vector<Cand>().swap(rows);
   }
-  unique[part]=move(cands);
+
+  radix_cands(canonical);
+  vector<Cand> winners;winners.reserve(canonical.size()+fallback.size());
+  for(size_t i=0;i<canonical.size();){
+   size_t j=i+1;size_t best=i;uint64_t key=cand_event_key(canonical[i]);
+   while(j<canonical.size()&&cand_event_key(canonical[j])==key){
+    if(cand_ingest_ms(canonical[j],ws)<cand_ingest_ms(canonical[best],ws))best=j;
+    j++;
+   }
+   winners.push_back(canonical[best]);i=j;
+  }
+  vector<Cand>().swap(canonical);
+
+  if(!fallback.empty()){
+   vector<Cand> fb;fb.reserve(fallback.size());
+   FlatEventIndex idx(fb,fallback.size());
+   for(const Cand& c:fallback){
+    uint32_t ix=idx.get_or_create(c);
+    if(ix==UINT32_MAX)fb.push_back(c);
+    else if(cand_ingest_ms(c,ws)<cand_ingest_ms(fb[ix],ws))fb[ix]=c;
+   }
+   winners.insert(winners.end(),fb.begin(),fb.end());
+  }
+  vector<Cand>().swap(fallback);
+  unique[part]=move(winners);
  }
  vector<vector<Cand>>().swap(raw);lap("event_dedup");
  // Validate winners in parallel. The linked-ID table is immutable here, so its lookups
