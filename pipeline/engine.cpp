@@ -426,6 +426,31 @@ struct FastPeople {
   return id;
  }
 };
+static void radix_dedup_canonical(vector<Cand>& rows,unsigned partition_bits,int64_t ws,vector<Cand>& winners){
+ if(rows.empty())return;
+ vector<Cand> tmp(rows.size());
+ static thread_local vector<uint32_t> hist(1u<<16),pos(1u<<16);
+ for(unsigned pass=0;pass<2;pass++){
+  fill(hist.begin(),hist.end(),0);
+  unsigned shift=partition_bits+pass*16;
+  for(const Cand&c:rows)hist[(uint32_t)((c.idtag&~NONCOMPACT_PAYLOAD)>>shift)&0xffffu]++;
+  uint32_t at=0;
+  for(size_t i=0;i<hist.size();i++){uint32_t n=hist[i];pos[i]=at;at+=n;}
+  for(const Cand&c:rows){uint32_t b=(uint32_t)((c.idtag&~NONCOMPACT_PAYLOAD)>>shift)&0xffffu;tmp[pos[b]++]=c;}
+  rows.swap(tmp);
+ }
+ size_t i=0;
+ while(i<rows.size()){
+  uint64_t key=rows[i].idtag&~NONCOMPACT_PAYLOAD;
+  size_t j=i+1,best=i;int64_t best_ingest=cand_ingest_ms(rows[i],ws);
+  while(j<rows.size()&&(rows[j].idtag&~NONCOMPACT_PAYLOAD)==key){
+   int64_t ingest=cand_ingest_ms(rows[j],ws);
+   if(ingest<best_ingest){best=j;best_ingest=ingest;}
+   j++;
+  }
+  winners.push_back(rows[best]);i=j;
+ }
+}
 struct FlatEventIndex {
  vector<uint64_t> packed;
  vector<uint32_t> wide;
@@ -758,17 +783,25 @@ int main(){
 #endif
   auto& cache=event_people_cache[lookup_tid];
   size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
-  vector<Cand> cands;cands.reserve(n);
-  FlatEventIndex idx(cands,n,countr_zero(PARTS));
+  vector<Cand> canonical,dirty;
+  canonical.reserve(n*7/8+16);dirty.reserve(n/8+16);
   for(size_t t=0;t<workers;t++){
-   auto& rows=raw[t*PARTS+part];
-   for(const Cand& c:rows){
-      uint32_t ix=idx.get_or_create(c);
-      if(ix==UINT32_MAX)cands.push_back(c);
-      else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
+   auto& src=raw[t*PARTS+part];
+   for(const Cand& c:src){
+    if((c.idtag&NONCANON_ID)==0)canonical.push_back(c);else dirty.push_back(c);
    }
-   vector<Cand>().swap(rows);
+   vector<Cand>().swap(src);
   }
+  vector<Cand> cands;cands.reserve(n);
+  radix_dedup_canonical(canonical,countr_zero(PARTS),ws,cands);
+  vector<Cand>().swap(canonical);
+  FlatEventIndex idx(cands,dirty.size(),countr_zero(PARTS));
+  for(const Cand& c:dirty){
+   uint32_t ix=idx.get_or_create(c);
+   if(ix==UINT32_MAX)cands.push_back(c);
+   else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
+  }
+  vector<Cand>().swap(dirty);
   auto& rows=cands;
   auto& good=valid_by_part[part];
   auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
