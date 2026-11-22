@@ -778,42 +778,28 @@ int main(){
    filter_repeat[word]|=filter_seen[word]&bit;
    filter_seen[word]|=bit;
   }
-  vector<Cand> cands;cands.reserve(n);
-  // Reserve only for the ambiguous minority, not all event IDs.
-  FlatEventIndex idx(cands,max<size_t>(16,n/8),countr_zero(PARTS));
-  for(size_t t=0;t<workers;t++){
-   auto& rows=raw[t*PARTS+part];
-   for(const Cand& c:rows){
-    size_t i=fingerprint(c);
-    if(!(filter_repeat[i>>6]&(1ULL<<(i&63)))){cands.push_back(c);continue;}
-    uint32_t ix=idx.get_or_create(c);
-    if(ix==UINT32_MAX)cands.push_back(c);
-    else if(cand_ingest_ms(c,ws)<cand_ingest_ms(cands[ix],ws))cands[ix]=c;
-   }
-   vector<Cand>().swap(rows);
-  }
-  auto& rows=cands;
+
   auto& good=valid_by_part[part];
   auto& pending=pending_by_part[part];auto& pending_num=pending_num_by_part[part];
   good.reserve(rows.size());pending.reserve(32);pending_num.reserve(rows.size()/3+16);
   SV f[7];
-  for(const Cand& c:rows){
+  auto emit=[&](const Cand& c){
    SV user,prod;uint8_t tp;uint32_t t,user_hash=0;uint64_t uk=UINT64_MAX;int32_t price=0;uint16_t cat=unknown;
    if((c.idtag&(NONCANON_ID|NONCOMPACT_PAYLOAD))==0){
     uk=cand_user_key(c);t=cand_time(c);tp=cand_type(c);price=cand_price(c);cat=cand_category(c);
-    if(cand_product_empty(c)||tp==3||t==0x7fffffffU)continue;
-    if(cand_ingest_ms(c,ws)-(ws+(int64_t)t)>DAY)continue;
-    if(tp==2&&price<=0)continue;
+    if(cand_product_empty(c)||tp==3||t==0x7fffffffU)return;
+    if(cand_ingest_ms(c,ws)-(ws+(int64_t)t)>DAY)return;
+    if(tp==2&&price<=0)return;
    }else{
-    SV fline=cand_line(c);if(!split_csv(fline,7,f))continue;
+    SV fline=cand_line(c);if(!split_csv(fline,7,f))return;
     user=f[1];prod=f[5];
     if(!canonical_base36_id(user,'u',uk))user_hash=(uint32_t)Hash{}(user);
     tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
-    if(user.empty()||prod.empty()||tp==3)continue;
-    int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||cand_ingest_ms(c,ws)-ts>DAY)continue;
+    if(user.empty()||prod.empty()||tp==3)return;
+    int64_t ts;if(!parse_time(f[2],ts)||ts<ws||ts>=we||cand_ingest_ms(c,ws)-ts>DAY)return;
     t=(uint32_t)(ts-ws);
     if(tp==2){
-     price=parse_price(f[6]);if(price<=0)continue;uint32_t pn;
+     price=parse_price(f[6]);if(price<=0)return;uint32_t pn;
      if(product_number(prod,pn)&&pn<product_fast.size())cat=product_fast[pn]==UINT16_MAX?unknown:product_fast[pn];
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
@@ -822,8 +808,24 @@ int main(){
    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
    else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
+  };
+  // Proven-unique candidates are validated immediately. Potential duplicates
+  // still go through exact earliest-ingest selection before validation.
+  vector<Cand> ambiguous;ambiguous.reserve(max<size_t>(16,n/8));
+  FlatEventIndex idx(ambiguous,max<size_t>(16,n/8),countr_zero(PARTS));
+  for(size_t t=0;t<workers;t++){
+   auto& src=raw[t*PARTS+part];
+   for(const Cand& c:src){
+    size_t i=fingerprint(c);
+    if(!(filter_repeat[i>>6]&(1ULL<<(i&63)))){emit(c);continue;}
+    uint32_t ix=idx.get_or_create(c);
+    if(ix==UINT32_MAX)ambiguous.push_back(c);
+    else if(cand_ingest_ms(c,ws)<cand_ingest_ms(ambiguous[ix],ws))ambiguous[ix]=c;
+   }
+   vector<Cand>().swap(src);
   }
-  vector<Cand>().swap(rows);
+  for(const Cand& c:ambiguous)emit(c);
+  vector<Cand>().swap(ambiguous);
  }
  vector<vector<Cand>>().swap(raw);
  lap("event_dedup_validate");
