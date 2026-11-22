@@ -362,64 +362,39 @@ struct FastOut{
   x[5]='0'+m/10;x[6]='0'+m%10;x[7]='-';x[8]='0'+d/10;x[9]='0'+d%10;raw(x,10);
  }
 };
-template<class T,class Key>
-static void radix64(vector<T>& a, Key key, int passes=4){
+template<class T,class Time>
+static void bucket_person_time(vector<T>& a,size_t person_count,Time time_key){
  if(a.size()<2)return;
- constexpr size_t R=1u<<16, MASK=R-1;
- int nt=1;
-#ifdef _OPENMP
- nt=max(1,omp_get_max_threads());
-#endif
+ vector<size_t> off(person_count+1,0);
+ for(const T& x:a)off[(size_t)x.person+1]++;
+ for(size_t i=1;i<off.size();i++)off[i]+=off[i-1];
+ vector<size_t> pos=off;
  vector<T> tmp(a.size());
- vector<size_t> hist((size_t)nt*R), pos((size_t)nt*R);
- for(int pass=0;pass<passes;pass++){
-  fill(hist.begin(),hist.end(),0);
-  unsigned shift=pass*16;
+ for(const T& x:a)tmp[pos[x.person]++]=x;
+ a.swap(tmp);
 #ifdef _OPENMP
-#pragma omp parallel
+#pragma omp parallel for schedule(static)
 #endif
-  {
-   int tid=0;
-#ifdef _OPENMP
-   tid=omp_get_thread_num();
-#endif
-   size_t lo=a.size()*(size_t)tid/nt, hi=a.size()*(size_t)(tid+1)/nt;
-   size_t* h=hist.data()+(size_t)tid*R;
-   for(size_t i=lo;i<hi;i++)h[(key(a[i])>>shift)&MASK]++;
+ for(size_t p=0;p<person_count;p++){
+  size_t lo=off[p],hi=off[p+1],n=hi-lo;
+  if(n<2)continue;
+  T* b=a.data()+lo;
+  if(n<=16){
+   for(size_t i=1;i<n;i++){
+    T v=b[i];size_t j=i;
+    while(j&&time_key(v)<time_key(b[j-1])){b[j]=b[j-1];--j;}
+    b[j]=v;
+   }
+  }else{
+   sort(b,b+n,[&](const T&x,const T&y){return time_key(x)<time_key(y);});
   }
-  size_t base=0;
-  for(size_t b=0;b<R;b++){
-   size_t total=0;
-   for(int t=0;t<nt;t++)total+=hist[(size_t)t*R+b];
-   size_t p=base;
-   for(int t=0;t<nt;t++){pos[(size_t)t*R+b]=p;p+=hist[(size_t)t*R+b];}
-   base+=total;
-  }
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-  {
-   int tid=0;
-#ifdef _OPENMP
-   tid=omp_get_thread_num();
-#endif
-   size_t lo=a.size()*(size_t)tid/nt, hi=a.size()*(size_t)(tid+1)/nt;
-   size_t* p=pos.data()+(size_t)tid*R;
-   for(size_t i=lo;i<hi;i++){size_t b=(key(a[i])>>shift)&MASK;tmp[p[b]++]=a[i];}
-  }
-  a.swap(tmp);
  }
 }
-static void order_events(vector<Evt>& es){
- radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
+static void order_events(vector<Evt>& es,size_t people){
+ bucket_person_time(es,people,[](const Evt&e){return e.t;});
 }
-static void order_clicks(vector<Click>& cs){
- radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
-}
-static void order_assists(vector<Assist>& as){
- // Stable LSD: first (campaign,time), then person.
- radix64(as,[](const Assist&a){return (uint64_t(a.campaign)<<32)|a.t;},3);
- radix64(as,[](const Assist&a){return uint64_t(a.person);},2);
+static void order_clicks(vector<Click>& cs,size_t people){
+ bucket_person_time(cs,people,[](const Click&c){return c.t;});
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
@@ -784,7 +759,7 @@ int main(){
  vector<vector<ClickCand>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
  // Sessions from globally sorted valid events, across every linked ID.
- order_events(events);lap("event_sort");
+ order_events(events,people.size());lap("event_bucket_sort");
  vector<UserDay> ud;ud.reserve(people.size()*2);
  vector<Session> sessions;sessions.reserve(events.size()/4+1);
  vector<Buy> buys;buys.reserve(events.size()/32+1);
@@ -815,7 +790,7 @@ int main(){
  vector<Buy>().swap(buys);lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
  auto campref=[&](uint16_t id,int32_t day)->CampDay&{return camp[(size_t)id*nday+day-day_base];};
- order_clicks(clicks);lap("click_sort");
+ order_clicks(clicks,people.size());lap("click_bucket_sort");
  // A single latest click cursor gives correct inclusive, 7-day, byte-wise tie attribution.
  size_t c=0;uint32_t prev_person=UINT32_MAX;
  int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
