@@ -47,8 +47,8 @@ jobs:
           python3 starter-duckdb/scripts/compare.py out dev-answer
       - name: A/B benchmark current vs previous optimized commit
         run: |
-          generator/target/release/generate --seed 7 --events 5000000 --clicks 1250000 --output bench
-          git worktree add --detach /tmp/baseline 752c9271946aca823e868a9195b293ee86a5ea7e
+          generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output bench
+          git worktree add --detach /tmp/baseline f33bbe4ac67593e25e13e4055ffe0b6993218b82
           docker build --platform linux/amd64 -t shopping-sessions:baseline /tmp/baseline
 
           # Warm both images so timing is not dominated by first-read filesystem cache.
