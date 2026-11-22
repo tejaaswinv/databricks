@@ -1,0 +1,25 @@
+name: Inspect generator ordering
+on:
+  push:
+    branches: [inspect-generator]
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download generator
+        run: |
+          curl -fsSL --retry 3 'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip' -o /tmp/generator.zip
+          unzip -q /tmp/generator.zip
+      - name: Show partition and ordering code
+        run: |
+          echo '=== Parts definitions ==='
+          grep -RInE 'struct Parts|impl Parts|fn part|parts\.|write.*part|shuffle|partition|event\(|events\(|click\(|clicks\(' generator/src | head -n 260
+          echo '=== likely parts source ==='
+          for f in generator/src/*.rs; do
+            if grep -q 'struct Parts' "$f"; then sed -n '1,280p' "$f"; fi
+          done
+          echo '=== user generation around event/click loops ==='
+          sed -n '230,490p' generator/src/user.rs
+          echo '=== plan/output code ==='
+          grep -RInE 'Parts|part_count|events_part|clicks_part|events/|clicks/' generator/src | head -n 240
