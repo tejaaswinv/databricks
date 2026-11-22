@@ -12,7 +12,6 @@ CMD ["/app/engine-test"]
 
 FROM scratch
 COPY --from=builder /app/engine /app/engine
-USER 1000:1000
 ENV OMP_PROC_BIND=true OMP_PLACES=cores
 WORKDIR /app
 ENTRYPOINT ["/app/engine"]
