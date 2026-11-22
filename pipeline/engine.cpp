@@ -682,7 +682,7 @@ int main(){
   const char* first=header+1;
   if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(128,(span+262143)/262144));
+  size_t np=max<size_t>(1,min<size_t>(32,(span+4194303)/4194304));
   vector<const char*> bounds(np+1);
   bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){
@@ -928,7 +928,7 @@ int main(){
   const char* header=(const char*)memchr(m.p,'\n',m.n);if(!header)continue;
   const char* first=header+1;if(first==end)continue;
   size_t span=end-first;
-  size_t np=max<size_t>(1,min<size_t>(64,(span+262143)/262144));
+  size_t np=max<size_t>(1,min<size_t>(32,(span+2097151)/2097152));
   vector<const char*> bounds(np+1);bounds[0]=first;bounds[np]=end;
   for(size_t j=1;j<np;j++){const char* p=first+span*j/np;const char* q=(const char*)memchr(p,'\n',end-p);bounds[j]=q?q+1:end;}
   for(size_t j=0;j<np;j++)if(bounds[j]<bounds[j+1])click_chunks.push_back({bounds[j],bounds[j+1]});
@@ -999,155 +999,108 @@ int main(){
  }
  vector<vector<Click>>().swap(click_unique);
  cerr<<"valid clicks="<<clicks.size()<<"\n";lap("click_parse_dedup");
- // Sessions from globally sorted valid events, across every linked ID.
+ // Keep the advanced global radix order, but fuse all downstream state per person.
  order_events(events);lap("event_sort");
- // Count output ranges first so independent groups of whole people can write
- // directly into final arrays. No locks or concatenation of session copies.
- size_t session_parts=min<size_t>(workers*4,max<size_t>(1,events.size()/65536));
- vector<size_t> event_bounds(session_parts+1);event_bounds.back()=events.size();
- for(size_t part=1;part<session_parts;part++){
-  size_t at=events.size()*part/session_parts;
-  while(at<events.size()&&events[at].person==events[at-1].person)at++;
-  event_bounds[part]=at;
- }
- struct SessionCounts{size_t users=0,sessions=0,buys=0;};
- vector<SessionCounts> counts(session_parts+1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
-#endif
- for(size_t part=0;part<session_parts;part++){
-  SessionCounts count;
-  uint32_t previous=UINT32_MAX,last_time=0;int32_t last_day=INT32_MIN;
-  for(size_t i=event_bounds[part];i<event_bounds[part+1];i++){
-   const Evt& e=events[i];
-   if(e.person!=previous||uint64_t(e.t)-last_time>(uint64_t)GAP){
-    int32_t day=epoch_day(ws+(int64_t)e.t);
-    if(e.person!=previous||day!=last_day){count.users++;last_day=day;}
-    count.sessions++;
-   }
-   count.buys+=e.is_purchase;previous=e.person;last_time=e.t;
-  }
-  counts[part+1]=count;
- }
- for(size_t part=1;part<counts.size();part++){
-  counts[part].users+=counts[part-1].users;
-  counts[part].sessions+=counts[part-1].sessions;
-  counts[part].buys+=counts[part-1].buys;
- }
- vector<UserDay> ud(counts.back().users);
- vector<Session> sessions(counts.back().sessions);
- vector<Buy> buys(counts.back().buys);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
-#endif
- for(size_t part=0;part<session_parts;part++){
-  size_t ui=counts[part].users,si=counts[part].sessions,bi=counts[part].buys;
-  uint32_t previous=UINT32_MAX,last_time=0;int32_t last_day=INT32_MIN;
-  for(size_t i=event_bounds[part];i<event_bounds[part+1];i++){
-   const Evt& e=events[i];
-   if(e.person!=previous||uint64_t(e.t)-last_time>(uint64_t)GAP){
-    int64_t start=ws+(int64_t)e.t;int32_t day=epoch_day(start);
-    if(e.person!=previous||day!=last_day){ud[ui++]={e.person,day};last_day=day;}
-    ud[ui-1].sessions++;
-    sessions[si++]={start,0,e.person,(uint32_t)(ui-1),organic,0,0};
-   }
-   previous=e.person;last_time=e.t;
-   auto& session=sessions[si-1];auto& user=ud[ui-1];user.events++;
-   if(e.is_purchase){
-    session.purchased=1;session.revenue+=e.price;user.revenue+=e.price;
-    buys[bi++]={(uint32_t)(ui-1),e.category,e.price};
-   }
-  }
- }
- vector<Evt>().swap(events);
- cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
- // Purchase category totals are per person-day, NOT per session, with byte-order ties.
- sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
- uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
- for(size_t i=0;i<buys.size();){size_t j=i+1;int64_t amt=buys[i].price;while(j<buys.size()&&buys[j].userday==buys[i].userday&&buys[j].category==buys[i].category)amt+=buys[j++].price;
-  if(buys[i].userday!=curr){curr=buys[i].userday;bestamt=-1;bestcat=UINT16_MAX;}
-  uint16_t cat=buys[i].category;
-  if(amt>bestamt||(amt==bestamt && (bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){bestamt=amt;bestcat=cat;ud[curr].top_category=cat;}
-  i=j;
- }
- vector<Buy>().swap(buys);lap("top_category");
- vector<CampDay> camp((size_t)campaigns.size()*nday);
  order_clicks(clicks);lap("click_sort");
- // Whole-person work units keep attribution cursors and assist intervals local
- // to one worker. Aggregate into private campaign arrays, then reduce once.
+ vector<size_t> event_off(people.size()+1),click_off(people.size()+1);
+ {
+  size_t at=0;
+  for(size_t person=0;person<people.size();person++){
+   event_off[person]=at;
+   while(at<events.size()&&events[at].person==person)at++;
+  }
+  event_off[people.size()]=at;
+  at=0;
+  for(size_t person=0;person<people.size();person++){
+   click_off[person]=at;
+   while(at<clicks.size()&&clicks[at].person==person)at++;
+  }
+  click_off[people.size()]=at;
+ }
+ const int nt=max(1,ncpu);
+ const size_t camp_cells=(size_t)campaigns.size()*nday;
+ vector<vector<UserDay>> ud_tls(nt);
+ vector<vector<CampDay>> camp_tls(nt,vector<CampDay>(camp_cells));
+ for(auto&v:ud_tls)v.reserve(max<size_t>(64,people.size()*2/(size_t)nt));
  const int64_t click_base=ws-WEEK;
- vector<pair<size_t,size_t>> spans(people.size(),{0,0}),click_spans(people.size(),{0,0});
- for(size_t i=0;i<sessions.size();){size_t j=i+1;while(j<sessions.size()&&sessions[j].person==sessions[i].person)j++;spans[sessions[i].person]={i,j};i=j;}
- for(size_t i=0;i<clicks.size();){size_t j=i+1;while(j<clicks.size()&&clicks[j].person==clicks[i].person)j++;click_spans[clicks[i].person]={i,j};i=j;}
- vector<vector<CampDay>> campaign_totals(workers,vector<CampDay>(camp.size()));
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
  {
-  size_t tid=0;
+  int tid=0;
 #ifdef _OPENMP
-  tid=(size_t)omp_get_thread_num();
+  tid=omp_get_thread_num();
 #endif
-  auto& totals=campaign_totals[tid];
-  auto aggregate=[&](uint16_t campaign,int32_t day)->CampDay&{return totals[(size_t)campaign*nday+day-day_base];};
-  auto count_assists=[&](uint32_t person,uint16_t campaign,int64_t a,int64_t b){
-   auto span=spans[person];
-   auto beg=sessions.begin()+span.first, end=sessions.begin()+span.second;
-   auto lo=lower_bound(beg,end,a,[](const Session&s,int64_t t){return s.start<t;});
-   auto hi=upper_bound(lo,end,b,[](int64_t t,const Session&s){return t<s.start;});
-   while(lo<hi){int32_t d=epoch_day(lo->start);int64_t until=(int64_t(d)+1)*DAY;
-    auto stop=lower_bound(lo,hi,until,[](const Session&s,int64_t t){return s.start<t;});
-    aggregate(campaign,d).assists+=stop-lo;lo=stop;
-   }
-  };
+  auto& out_ud=ud_tls[tid];auto& out_camp=camp_tls[tid];
+  vector<Session> ss;ss.reserve(32);vector<Buy> buys;buys.reserve(16);
   vector<vector<uint32_t>> campaign_times(campaigns.size()-1);
-  vector<uint16_t> touched;touched.reserve(min<size_t>(campaigns.size(),256));
+  vector<uint16_t> touched;touched.reserve(min<size_t>(campaigns.size(),128));
 #ifdef _OPENMP
-#pragma omp for schedule(dynamic,32)
+#pragma omp for schedule(dynamic,256)
 #endif
   for(size_t person=0;person<people.size();person++){
-   auto [sb,se]=spans[person];if(sb==se)continue;
-   auto [i,j]=click_spans[person];size_t c=i;
-   int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
-   for(size_t si=sb;si<se;si++){
-    auto& session=sessions[si];uint32_t session_ct=(uint32_t)(session.start-click_base);
-    while(c<j&&clicks[c].t<=session_ct){
-     uint32_t t=clicks[c].t;size_t stop=c+1,best=c;
-     while(stop<j&&clicks[stop].t==t){
-      if(byte_less(clicks[stop].clickid,clicks[best].clickid))best=stop;
-      stop++;
-     }
-     lastclicktime=click_base+(int64_t)t;lastcampaign=clicks[best].campaign;c=stop;
+   size_t elo=event_off[person],ehi=event_off[person+1];if(elo==ehi)continue;
+   ss.clear();buys.clear();size_t ud_base=out_ud.size();uint32_t lastt=0;bool first_event=true;
+   for(size_t ei=elo;ei<ehi;ei++){
+    const Evt&e=events[ei];
+    if(first_event||uint64_t(e.t)-lastt>(uint64_t)GAP){
+     int64_t start_abs=ws+(int64_t)e.t;int32_t d=epoch_day(start_abs);
+     if(out_ud.size()==ud_base||out_ud.back().day!=d)out_ud.push_back({(uint32_t)person,d});
+     out_ud.back().sessions++;
+     ss.push_back({start_abs,0,(uint32_t)person,(uint32_t)(out_ud.size()-ud_base-1),organic,0,0});
+     first_event=false;
     }
-    uint16_t credited=(lastclicktime!=INT64_MIN&&session.start-lastclicktime<=WEEK)?lastcampaign:organic;
-    auto& value=aggregate(credited,epoch_day(session.start));
-    value.sessions++;value.purchasing+=session.purchased;value.revenue+=session.revenue;
+    lastt=e.t;Session& ses=ss.back();UserDay&u=out_ud[ud_base+ses.userday];u.events++;
+    if(e.is_purchase){ses.purchased=1;ses.revenue+=e.price;u.revenue+=e.price;buys.push_back({ses.userday,e.category,e.price});}
+   }
+   sort(buys.begin(),buys.end(),[](const Buy&a,const Buy&b){return a.userday<b.userday||(a.userday==b.userday&&a.category<b.category);});
+   uint32_t curr=UINT32_MAX;uint16_t bestcat=UINT16_MAX;int64_t bestamt=-1;
+   for(size_t bi=0;bi<buys.size();){
+    size_t bj=bi+1;int64_t amt=buys[bi].price;
+    while(bj<buys.size()&&buys[bj].userday==buys[bi].userday&&buys[bj].category==buys[bi].category)amt+=buys[bj++].price;
+    if(buys[bi].userday!=curr){curr=buys[bi].userday;bestamt=-1;bestcat=UINT16_MAX;}
+    uint16_t cat=buys[bi].category;
+    if(amt>bestamt||(amt==bestamt&&(bestcat==UINT16_MAX||byte_less(categories[cat],categories[bestcat])))){bestamt=amt;bestcat=cat;out_ud[ud_base+curr].top_category=cat;}
+    bi=bj;
+   }
+   size_t c=click_off[person],cend=click_off[person+1];int64_t lastclicktime=INT64_MIN;uint16_t lastcampaign=organic;
+   for(Session& ses:ss){
+    uint32_t session_ct=(uint32_t)(ses.start-click_base);
+    while(c<cend&&clicks[c].t<=session_ct){
+     uint32_t ct=clicks[c].t;size_t j=c+1,best=c;
+     while(j<cend&&clicks[j].t==ct){if(byte_less(clicks[j].clickid,clicks[best].clickid))best=j;j++;}
+     lastclicktime=click_base+(int64_t)ct;lastcampaign=clicks[best].campaign;c=j;
+    }
+    uint16_t credited=(lastclicktime!=INT64_MIN&&ses.start-lastclicktime<=WEEK)?lastcampaign:organic;
+    auto&a=out_camp[(size_t)credited*nday+epoch_day(ses.start)-day_base];
+    a.sessions++;a.revenue+=ses.revenue;a.purchasing+=ses.purchased;
    }
    touched.clear();
-   for(size_t z=i;z<j;z++){
-    uint16_t campaign=clicks[z].campaign;
-    auto& times=campaign_times[campaign];
-    if(times.empty())touched.push_back(campaign);
-    times.push_back(clicks[z].t);
+   for(size_t ci=click_off[person];ci<click_off[person+1];ci++){
+    uint16_t campaign=clicks[ci].campaign;auto&times=campaign_times[campaign];
+    if(times.empty())touched.push_back(campaign);times.push_back(clicks[ci].t);
    }
-   for(uint16_t campaign:touched){
-    auto& times=campaign_times[campaign];
-    int64_t from=click_base+(int64_t)times[0],to=from+WEEK;
-    for(size_t z=1;z<times.size();z++){
-     int64_t a=click_base+(int64_t)times[z],b=a+WEEK;
-     if(a<=to)to=max(to,b);else{count_assists((uint32_t)person,campaign,from,to);from=a;to=b;}
+   auto add_assists=[&](uint16_t campaign,int64_t from,int64_t to){
+    auto lo=lower_bound(ss.begin(),ss.end(),from,[](const Session&x,int64_t t){return x.start<t;});
+    auto hi=upper_bound(lo,ss.end(),to,[](int64_t t,const Session&x){return t<x.start;});
+    while(lo<hi){int32_t d=epoch_day(lo->start);int64_t until=(int64_t(d)+1)*DAY;
+     auto stop=lower_bound(lo,hi,until,[](const Session&x,int64_t t){return x.start<t;});
+     out_camp[(size_t)campaign*nday+d-day_base].assists+=stop-lo;lo=stop;
     }
-    count_assists((uint32_t)person,campaign,from,to);
-    times.clear();
+   };
+   for(uint16_t campaign:touched){
+    auto&times=campaign_times[campaign];int64_t from=click_base+(int64_t)times[0],to=from+WEEK;
+    for(size_t z=1;z<times.size();z++){int64_t a=click_base+(int64_t)times[z],b=a+WEEK;if(a<=to)to=max(to,b);else{add_assists(campaign,from,to);from=a;to=b;}}
+    add_assists(campaign,from,to);times.clear();
    }
   }
  }
- for(const auto& totals:campaign_totals)for(size_t i=0;i<camp.size();i++){
-  camp[i].sessions+=totals[i].sessions;camp[i].purchasing+=totals[i].purchasing;
-  camp[i].revenue+=totals[i].revenue;camp[i].assists+=totals[i].assists;
- }
- vector<Click>().swap(clicks);
- lap("attribution_assists");
+ vector<Evt>().swap(events);vector<Click>().swap(clicks);event_off.clear();click_off.clear();
+ size_t ud_total=0;for(auto&v:ud_tls)ud_total+=v.size();vector<UserDay> ud;ud.reserve(ud_total);
+ for(auto&v:ud_tls){ud.insert(ud.end(),v.begin(),v.end());vector<UserDay>().swap(v);}vector<vector<UserDay>>().swap(ud_tls);
+ vector<CampDay> camp(camp_cells);
+ for(int t=0;t<nt;t++)for(size_t i=0;i<camp_cells;i++){auto&s=camp_tls[t][i];auto&d=camp[i];d.sessions+=s.sessions;d.purchasing+=s.purchasing;d.revenue+=s.revenue;d.assists+=s.assists;}
+ vector<vector<CampDay>>().swap(camp_tls);lap("fused_person_state");
  fs::create_directories(out);
  fs::create_directories(out+"/user_daily");
  fs::create_directories(out+"/campaign_daily");
