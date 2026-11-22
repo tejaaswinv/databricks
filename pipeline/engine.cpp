@@ -581,7 +581,6 @@ static void order_clicks(vector<Click>& cs){
  radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
 }
 int main(){
- umask(0);
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
  const string out=getenv("OUTPUT_DIR")?getenv("OUTPUT_DIR"):"/output";
  int ncpu=max(1,getenv("NCPU")?atoi(getenv("NCPU")):8);
