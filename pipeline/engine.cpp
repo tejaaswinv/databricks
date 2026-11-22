@@ -226,7 +226,7 @@ struct PackedNumPeople {
 // This cache is scoped to a phase with an immutable identity index. Separate
 // instances after standalone interning prevent stale negative click lookups.
 struct IdentityCache {
- static constexpr size_t SIZE=131072;
+ static constexpr size_t SIZE=2048;
  array<uint64_t,SIZE> keys{};
  array<uint32_t,SIZE> values{};
  uint32_t find(const PackedNumPeople& index,uint64_t key){
@@ -655,15 +655,6 @@ int main(){
  PackedNumPeople numeric_people=std::move(dsu.numeric);
  numeric_people.remap(link_person);
  advise_huge_pages(numeric_people.slots.data(),numeric_people.slots.size()*sizeof(uint64_t),true);
- // Exact negative filter for event-time identity lookup. A clear bit proves that
- // this canonical user ID was not present in the link graph; set bits still use
- // the collision-safe PackedNumPeople lookup.
- static constexpr size_t LINK_PRESENCE_BITS=1u<<24;
- vector<uint64_t> link_presence(LINK_PRESENCE_BITS/64,0);
- auto presence_bit=[](uint64_t k)->uint32_t{return (uint32_t)((k^(k>>23)^(k>>37))&(LINK_PRESENCE_BITS-1));};
- for(size_t i=0;i<numeric_people.slots.size();i++)if(numeric_people.slots[i]){
-  uint32_t b=presence_bit(numeric_people.key_at(i));link_presence[b>>6]|=1ULL<<(b&63);
- }
  for(uint32_t i:dsu.special_nodes)person_map.add_link(dsu.nodes[i].value,link_person[i]);
  dsu.buckets.clear();dsu.buckets.shrink_to_fit();
  cerr<<"subphase link_build="<<chrono::duration<double>(links_built-links_start).count()<<"s canonicalize="<<chrono::duration<double>(chrono::steady_clock::now()-links_built).count()<<"s\n";
@@ -752,7 +743,6 @@ int main(){
   }
  }
  lap("event_parse");
- vector<IdentityCache> event_people_cache(workers);
  vector<vector<Evt>> valid_by_part(PARTS);
  vector<vector<PendingEvt>> pending_by_part(PARTS);
  vector<vector<PendingNum>> pending_num_by_part(PARTS);
@@ -761,11 +751,6 @@ int main(){
 #pragma omp parallel for schedule(dynamic,1)
 #endif
  for(size_t part=0;part<PARTS;part++){
-  size_t lookup_tid=0;
-#ifdef _OPENMP
-  lookup_tid=(size_t)omp_get_thread_num();
-#endif
-  auto& cache=event_people_cache[lookup_tid];
   size_t n=0;for(size_t t=0;t<workers;t++)n+=raw[t*PARTS+part].size();
   vector<Cand> cands;cands.reserve(n);
   FlatEventIndex idx(cands,n,countr_zero(PARTS));
@@ -804,14 +789,14 @@ int main(){
      else {auto it=products.find(prod);if(it!=products.end())cat=it->second;}
     }
    }
-   uint32_t p;
    if(uk!=UINT64_MAX){
-    uint32_t b=presence_bit(uk);
-    p=(link_presence[b>>6]&(1ULL<<(b&63)))?cache.find(numeric_people,uk):UINT32_MAX;
-   }else p=person_map.find_hashed(user,user_hash);
-   if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
-   else if(uk!=UINT64_MAX)pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
-   else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
+    // Resolve canonical aliases once per cache-local numeric shard below.
+    pending_num.push_back({uk,t,price,cat,(uint8_t)(tp==2),0});
+   }else{
+    uint32_t p=person_map.find_hashed(user,user_hash);
+    if(p!=UINT32_MAX)good.push_back({t,p,price,cat,(uint8_t)(tp==2),0});
+    else pending.push_back({user,t,price,user_hash,cat,(uint8_t)(tp==2),0});
+   }
   }
   vector<Cand>().swap(rows);
  }
@@ -823,8 +808,9 @@ int main(){
  vector<Evt> events;events.reserve(good_n+pending_n+pending_num_n);
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
- // Partition unresolved numeric identities once, then intern each shard without
- // locks. Repeated events no longer revisit one large mutable identity table.
+ // Partition every canonical numeric identity once. Each private shard resolves
+ // a distinct alias against the linked-ID map only on first occurrence; repeated
+ // events stay inside a cache-local table.
  constexpr size_t NUM_SHARDS=256;
  vector<size_t> numeric_counts(PARTS*NUM_SHARDS),numeric_offsets(PARTS*NUM_SHARDS);
 #ifdef _OPENMP
@@ -875,9 +861,13 @@ int main(){
    uint64_t local_key=e.key/NUM_SHARDS;
    uint32_t p=local.find(local_key);
    if(p==UINT32_MAX){
-    p=next_numeric.fetch_add(1,memory_order_relaxed);
-    names.push_back(canonical_user_name(e.key));people[p]=names.back();
-    local.add(local_key,p);identities.push_back({e.key,p});
+    p=numeric_people.find(e.key);
+    if(p==UINT32_MAX){
+     p=next_numeric.fetch_add(1,memory_order_relaxed);
+     names.push_back(canonical_user_name(e.key));people[p]=names.back();
+     identities.push_back({e.key,p});
+    }
+    local.add(local_key,p);
    }
    events[good_n+i]={e.t,p,e.price,e.category,e.is_purchase,0};
   }
