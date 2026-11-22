@@ -530,9 +530,9 @@ static void radix64(vector<T>& a, Key key, int passes=4){
 #ifdef _OPENMP
  nt=max(1,omp_get_max_threads());
 #endif
- if(a.size()<32768){sort(a.begin(),a.end(),[&](const T& x,const T& y){return key(x)<key(y);});return;}
+ if(a.size()<32768||a.size()>=UINT32_MAX){sort(a.begin(),a.end(),[&](const T& x,const T& y){return key(x)<key(y);});return;}
  vector<T> tmp(a.size());
- vector<size_t> hist((size_t)nt*R), pos((size_t)nt*R);
+ vector<uint32_t> hist((size_t)nt*R), pos((size_t)nt*R);
  for(int pass=0;pass<passes;pass++){
   fill(hist.begin(),hist.end(),0);
   unsigned shift=pass*BITS;
@@ -548,14 +548,14 @@ static void radix64(vector<T>& a, Key key, int passes=4){
    active=omp_get_num_threads();
 #endif
    size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
-   size_t* h=hist.data()+(size_t)tid*R;
+   uint32_t* h=hist.data()+(size_t)tid*R;
    for(size_t i=lo;i<hi;i++)h[(key(a[i])>>shift)&MASK]++;
   }
   size_t base=0;
   for(size_t b=0;b<R;b++){
-   size_t total=0;
+   uint32_t total=0;
    for(int t=0;t<active;t++)total+=hist[(size_t)t*R+b];
-   size_t p=base;
+   uint32_t p=(uint32_t)base;
    for(int t=0;t<active;t++){pos[(size_t)t*R+b]=p;p+=hist[(size_t)t*R+b];}
    base+=total;
   }
@@ -568,7 +568,7 @@ static void radix64(vector<T>& a, Key key, int passes=4){
    tid=omp_get_thread_num();
 #endif
    size_t lo=a.size()*(size_t)tid/active, hi=a.size()*(size_t)(tid+1)/active;
-   size_t* p=pos.data()+(size_t)tid*R;
+   uint32_t* p=pos.data()+(size_t)tid*R;
    for(size_t i=lo;i<hi;i++){size_t b=(key(a[i])>>shift)&MASK;tmp[p[b]++]=a[i];}
   }
   a.swap(tmp);
