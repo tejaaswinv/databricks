@@ -812,7 +812,7 @@ int main(){
  vector<vector<Evt>>().swap(valid_by_part);
  // Partition unresolved numeric identities once, then intern each shard without
  // locks. Repeated events no longer revisit one large mutable identity table.
- constexpr size_t NUM_SHARDS=256;
+ constexpr size_t NUM_SHARDS=1024;
  vector<size_t> numeric_counts(PARTS*NUM_SHARDS),numeric_offsets(PARTS*NUM_SHARDS);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
