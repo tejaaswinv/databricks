@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "native_parquet.hpp"
+#include "csv_reader.hpp"
 #ifdef _OPENMP
 #include <parallel/algorithm>
 #include <omp.h>
@@ -48,27 +49,49 @@ static inline bool campaign_number(SV s,uint32_t& out){
  out=v;return true;
 }
 static bool canonical_base36_id(SV s,char prefix,uint64_t& out){
- if(s.size()<2||s[0]!=prefix||(s.size()>2&&s[1]=='0'))return false;
- uint64_t v=0;
- for(size_t i=1;i<s.size();i++){
-  unsigned char c=s[i];unsigned d;
-  if(c>='0'&&c<='9')d=c-'0';
-  else if(c>='a'&&c<='z')d=c-'a'+10;
-  else return false;
-  if(d>=36||v>((1ULL<<40)-1-d)/36)return false;
-  v=v*36+d;
+ if(s.size()<2||s.size()>9||s[0]!=prefix||(s.size()>2&&s[1]=='0'))return false;
+ static constexpr auto decode=[] {
+  array<uint8_t,256> a{};a.fill(0xff);
+  for(unsigned c='0';c<='9';c++)a[c]=c-'0';
+  for(unsigned c='a';c<='z';c++)a[c]=c-'a'+10;
+  return a;
+ }();
+ const auto* p=reinterpret_cast<const unsigned char*>(s.data()+1);
+ uint64_t v=0;unsigned bad=0;
+ if(s.size()==9){
+  unsigned a=decode[p[0]],b=decode[p[1]],c=decode[p[2]],d=decode[p[3]];
+  unsigned e=decode[p[4]],f=decode[p[5]],g=decode[p[6]],h=decode[p[7]];
+  bad=a|b|c|d|e|f|g|h;
+  v=uint64_t(a*36+b)*2176782336ULL+uint64_t(c*36+d)*1679616ULL+
+    uint64_t(e*36+f)*1296ULL+g*36+h;
+ }else{
+  for(size_t i=0;i<s.size()-1;i++){unsigned d=decode[p[i]];bad|=d;v=v*36+d;}
  }
+ if((bad&0xc0)||v>=(1ULL<<40))return false;
  out=v;return true;
 }
 static int64_t dnum(const char* p,int n) {int64_t x=0; for(int i=0;i<n;i++){if(p[i]<'0'||p[i]>'9')return -1; x=x*10+p[i]-'0';} return x;}
-static int64_t epoch_days(int y,int m,int d){ // Howard Hinnant: proleptic Gregorian
+static constexpr int64_t epoch_days(int y,int m,int d){
  y-=m<=2; int era=(y>=0 ? y:y-399)/400; unsigned yoe=(unsigned)(y-era*400); unsigned doy=(153*(m+(m>2?-3:9))+2)/5+d-1; unsigned yoe_days=yoe*365+yoe/4-yoe/100+doy; return int64_t(era)*146097+yoe_days-719468;
 }
-static bool parse_time(SV s,int64_t &val){
- // F1/F2 are fixed-width. Everything else can only be F3 and is validated in one pass.
- if(s.size()!=20 && s.size()!=25){
+static constexpr auto year_starts=[] {
+ array<int32_t,10000> a{};
+ for(int y=0;y<10000;y++)a[y]=(int32_t)epoch_days(y,1,1);
+ return a;
+}();
+static constexpr int month_starts[12]={0,31,59,90,120,151,181,212,243,273,304,334};
+static inline bool leap_year(int y){return y%4==0&&(y%100!=0||y%400==0);}
+static inline int32_t calendar_day(int y,int m,int d){
+ return year_starts[y]+month_starts[m-1]+d-1+(m>2&&leap_year(y));
+}
+static bool parse_time(SV s,int64_t &val,const char* known_date=nullptr,int32_t known_day=0){
+ if((s.size()!=20 && s.size()!=25)||s[4]!='-'){
   if(s.empty())return false;
   uint64_t n=0;
+  if(s.size()<=18){
+   for(unsigned char ch:s){if(ch<'0'||ch>'9')return false;n=n*10+(ch-'0');}
+   val=(int64_t)n;return true;
+  }
   for(unsigned char ch:s){
    if(ch<'0'||ch>'9')return false;
    unsigned d=ch-'0';if(n>(uint64_t(INT64_MAX)-d)/10)return false;n=n*10+d;
@@ -79,14 +102,20 @@ static bool parse_time(SV s,int64_t &val){
  if(p[4]!='-'||p[7]!='-'||p[10]!='T'||p[13]!=':'||p[16]!=':')return false;
  if(s.size()==20 && p[19]!='Z')return false;
  if(s.size()==25 && ((p[19]!='+'&&p[19]!='-')||p[22]!=':'))return false;
- int y=dnum(p,4),m=dnum(p+5,2),d=dnum(p+8,2),h=dnum(p+11,2),mi=dnum(p+14,2),se=dnum(p+17,2);
- if(y<1||m<1||m>12||d<1||h>23||mi>59||se>59||h<0||mi<0||se<0)return false;
- int md[12]={31,28,31,30,31,30,31,31,30,31,30,31};
- if(m==2 && (y%4==0 && (y%100!=0||y%400==0)))md[1]=29;
- if(d>md[m-1])return false;
+ int h=dnum(p+11,2),mi=dnum(p+14,2),se=dnum(p+17,2);
+ if(h>23||mi>59||se>59||h<0||mi<0||se<0)return false;
+ int32_t day;
+ if(known_date&&memcmp(p,known_date,10)==0)day=known_day;
+ else{
+  int y=dnum(p,4),m=dnum(p+5,2),d=dnum(p+8,2);
+  if(y<1||m<1||m>12||d<1)return false;
+  constexpr int md[12]={31,28,31,30,31,30,31,31,30,31,30,31};
+  if(d>md[m-1]+(m==2&&leap_year(y)))return false;
+  day=calendar_day(y,m,d);
+ }
  int offset=0;
  if(s.size()==25){int oh=dnum(p+20,2),om=dnum(p+23,2);if(oh>23||om>59||oh<0||om<0)return false;offset=oh*60+om;if(p[19]=='-')offset=-offset;}
- val=(epoch_days(y,m,d)*86400LL + h*3600+mi*60+se-int64_t(offset)*60)*1000;
+ val=(day*86400LL+h*3600+mi*60+se-int64_t(offset)*60)*1000;
  return true;
 }
 static int32_t epoch_day(int64_t ts){int64_t d=ts/DAY; if(ts<0 && ts%DAY)d--;return (int32_t)d;}
@@ -131,12 +160,9 @@ static bool split_csv(SV s,int n,SV *out){
 template<class F>static void foreach_csv(const Mapping&m,int n,F action){
  if(!m.n)return;
  const char *p=m.p,*end=m.p+m.n;
- const char *first=(const char*)memchr(p,'\n',end-p);if(!first)return;p=first+1; // header
+ const char *first=(const char*)memchr(p,'\n',end-p);if(!first)return;p=first+1;
  SV fields[7];
- while(p<end){const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
-  if(split_csv(SV(p,q-p),n,fields))action(fields);
-  p=(q==end)?end:q+1;
- }
+ while(p<end){if(exactcsv::next(p,end,n,fields))action(fields);}
 }
 struct Node{int parent,weight;SV value;};
 struct UnionFind{
@@ -328,18 +354,18 @@ struct FlatClickCandIndex {
   return true;
  }
 };
-static int64_t parse_ingest(SV s){
- // rules.md guarantees ingest_ts is valid F1; avoid the generic validator on every raw event.
+static int64_t parse_ingest(SV s,int32_t& day){
  const char* p=s.data();
  int y=(p[0]-'0')*1000+(p[1]-'0')*100+(p[2]-'0')*10+(p[3]-'0');
  int mo=(p[5]-'0')*10+(p[6]-'0'), d=(p[8]-'0')*10+(p[9]-'0');
  int h=(p[11]-'0')*10+(p[12]-'0'), mi=(p[14]-'0')*10+(p[15]-'0'), se=(p[17]-'0')*10+(p[18]-'0');
- return (epoch_days(y,mo,d)*86400LL+h*3600+mi*60+se)*1000;
+ day=calendar_day(y,mo,d);
+ return (day*86400LL+h*3600+mi*60+se)*1000;
 }
 static int32_t parse_price(SV s) {
- if(!digits(s))return -1;
+ if(s.empty())return -1;
  int32_t v=0;
- for(char c:s){v=v*10+(c-'0');if(v>10000000)return -1;}
+ for(unsigned char c:s){if(c<'0'||c>'9')return -1;v=v*10+(c-'0');if(v>10000000)return -1;}
  return v>0?v:-1;
 }
 static void fail(const string&s){cerr<<s<<'\n';exit(1);}
@@ -520,15 +546,16 @@ int main(){
   const char* p=chunks[ch].begin;const char* end=chunks[ch].end;
   SV f[7];
   while(p<end){
-   const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
-   SV line(p,q-p);
-   if(split_csv(line,7,f)&&!f[0].empty()){
-     uint64_t n=0,tag,uk=0,x0,x1;int64_t ingest=parse_ingest(f[3]);
+   const char* row_start=p;
+   if(exactcsv::events(p,end,7,f)&&!f[0].empty()){
+     const char* row_end=(p==end&&p[-1]!='\n')?end:p-1;
+     SV line(row_start,(size_t)(row_end-row_start));
+     uint64_t n=0,tag,uk=0,x0,x1;int32_t ingest_day;int64_t ingest=parse_ingest(f[3],ingest_day);
      bool event_canon=canonical_base36_id(f[0],'e',n);
      bool compact=event_canon && canonical_base36_id(f[1],'u',uk);
      uint8_t tp=f[4]=="purchase"?2:f[4]=="cart"?1:f[4]=="view"?0:3;
      int64_t ts;uint32_t toff=0x7fffffffU;
-     if(parse_time(f[2],ts)&&ts>=ws&&ts<we)toff=(uint32_t)(ts-ws);
+     if(parse_time(f[2],ts,f[3].data(),ingest_day)&&ts>=ws&&ts<we)toff=(uint32_t)(ts-ws);
      uint32_t price_code=0;if(tp==2){int32_t pv=parse_price(f[6]);if(pv>0)price_code=(uint32_t)pv;}
      bool prod_empty=f[5].empty();uint16_t cat=unknown;
      if(tp==2&&!prod_empty&&price_code){
@@ -552,7 +579,6 @@ int main(){
      }
      raw[tid*PARTS+((size_t)(tag&~NONCOMPACT_PAYLOAD)%PARTS)].push_back({x0,x1,tag});
    }
-   p=(q==end)?end:q+1;
   }
  }
  lap("event_parse");
@@ -713,8 +739,7 @@ int main(){
 #endif
   const char* p=click_chunks[ch].begin;const char* end=click_chunks[ch].end;SV f[4];
   while(p<end){
-   const char*q=(const char*)memchr(p,'\n',end-p);if(!q)q=end;
-   if(split_csv(SV(p,q-p),4,f)&&!f[0].empty()&&!f[1].empty()){
+   if(exactcsv::clicks(p,end,4,f)&&!f[0].empty()&&!f[1].empty()){
     uint16_t cid=campaign_for(f[2]);
     if(cid!=UINT16_MAX){
      int64_t ts;
@@ -729,7 +754,6 @@ int main(){
      }
     }
    }
-   p=(q==end)?end:q+1;
   }
  }
  vector<vector<ClickCand>> click_unique(CPARTS);
