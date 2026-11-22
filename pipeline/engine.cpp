@@ -704,12 +704,11 @@ int main(){
 #ifdef _OPENMP
   tid=(size_t)omp_get_thread_num();
 #endif
-  const char* begin=chunks[ch].begin;const char* end=chunks[ch].end;
-  auto consume_events=[&](auto reader){
-   const char* p=begin;SV f[7];
-   while(p<end){
-    const char* first=p;
-    if(reader(p,end,7,f)&&!f[0].empty()){
+  const char* p=chunks[ch].begin;const char* end=chunks[ch].end;
+  SV f[7];
+  while(p<end){
+   const char* first=p;
+   if(exactcsv::events(p,end,7,f)&&!f[0].empty()){
      const char* last=p==end&&p[-1]!='\n'?end:p-1;
      SV line(first,last-first);
      uint64_t n=0,tag,uk=0,x0,x1;int32_t ingest_day;int64_t ingest=parse_ingest(f[3],ingest_day);
@@ -740,19 +739,8 @@ int main(){
       x1=(uint64_t)line.size()|(sec40<<24);
      }
      raw[tid*PARTS+((size_t)(tag&~NONCOMPACT_PAYLOAD)%PARTS)].push_back({x0,x1,tag});
-    }
    }
-  };
-#if defined(__x86_64__)
-  __builtin_cpu_init();
-  if(__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
-   consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx512<7>(p,e,7,f);});
-  else if(__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
-   consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx2<7>(p,e,7,f);});
-  else consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::next_sse2<7>(p,e,7,f);});
-#else
-  consume_events([](const char*&p,const char*e,int,SV*f){return exactcsv::events(p,e,7,f);});
-#endif
+  }
  }
  lap("event_parse");
  vector<IdentityCache> event_people_cache(workers);
@@ -958,11 +946,9 @@ int main(){
 #ifdef _OPENMP
   tid=(size_t)omp_get_thread_num();
 #endif
-  const char* begin=click_chunks[ch].begin;const char* end=click_chunks[ch].end;
-  auto consume_clicks=[&](auto reader){
-   const char* p=begin;SV f[4];
-   while(p<end){
-    if(reader(p,end,4,f)&&!f[0].empty()&&!f[1].empty()){
+  const char* p=click_chunks[ch].begin;const char* end=click_chunks[ch].end;SV f[4];
+  while(p<end){
+   if(exactcsv::clicks(p,end,4,f)&&!f[0].empty()&&!f[1].empty()){
     uint16_t cid=campaign_for(f[2]);
     if(cid!=UINT16_MAX){
      int64_t ts;
@@ -980,18 +966,7 @@ int main(){
      }
     }
    }
-   }
-  };
-#if defined(__x86_64__)
-  __builtin_cpu_init();
-  if(__builtin_cpu_supports("avx512bw")&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
-   consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx512<4>(p,e,4,f);});
-  else if(__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi")&&__builtin_cpu_supports("popcnt"))
-   consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::next_avx2<4>(p,e,4,f);});
-  else consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::next_sse2<4>(p,e,4,f);});
-#else
-  consume_clicks([](const char*&p,const char*e,int,SV*f){return exactcsv::clicks(p,e,4,f);});
-#endif
+  }
  }
  vector<vector<Click>> click_unique(CPARTS);
 #ifdef _OPENMP
