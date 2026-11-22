@@ -391,51 +391,15 @@ struct FastOut{
 template<class T,class Time>
 static vector<size_t> bucket_person_time(vector<T>& a,size_t person_count,Time time_key){
  vector<size_t> off(person_count+1,0);
- if(a.empty())return off;
- int nt=1;
-#ifdef _OPENMP
- nt=max(1,omp_get_max_threads());
-#endif
- // Thread-local histograms remove the serial global count and serial scatter passes.
- vector<uint32_t> cnt((size_t)nt*person_count,0);
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
- {
-  int tid=0;
-#ifdef _OPENMP
-  tid=omp_get_thread_num();
-#endif
-  size_t lo=a.size()*(size_t)tid/nt,hi=a.size()*(size_t)(tid+1)/nt;
-  uint32_t* c=cnt.data()+(size_t)tid*person_count;
-  for(size_t i=lo;i<hi;i++)c[a[i].person]++;
- }
- for(size_t p=0;p<person_count;p++){
-  size_t total=0;for(int t=0;t<nt;t++)total+=cnt[(size_t)t*person_count+p];
-  off[p+1]=off[p]+total;
- }
+ for(const T& x:a)off[(size_t)x.person+1]++;
+ for(size_t i=1;i<off.size();i++)off[i]+=off[i-1];
  if(a.size()>1){
-  vector<size_t> starts((size_t)nt*person_count);
-  for(size_t p=0;p<person_count;p++){
-   size_t pos=off[p];
-   for(int t=0;t<nt;t++){starts[(size_t)t*person_count+p]=pos;pos+=cnt[(size_t)t*person_count+p];}
-  }
+  vector<size_t> pos=off;
   vector<T> tmp(a.size());
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-  {
-   int tid=0;
-#ifdef _OPENMP
-   tid=omp_get_thread_num();
-#endif
-   size_t lo=a.size()*(size_t)tid/nt,hi=a.size()*(size_t)(tid+1)/nt;
-   size_t* pos=starts.data()+(size_t)tid*person_count;
-   for(size_t i=lo;i<hi;i++)tmp[pos[a[i].person]++]=a[i];
-  }
+  for(const T& x:a)tmp[pos[x.person]++]=x;
   a.swap(tmp);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,256)
+#pragma omp parallel for schedule(static)
 #endif
   for(size_t p=0;p<person_count;p++){
    size_t lo=off[p],hi=off[p+1],n=hi-lo;
@@ -689,45 +653,16 @@ int main(){
  for(auto& v:valid_by_part){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
  vector<vector<Evt>>().swap(valid_by_part);
  deque<string> owned_user_names;
- // Resolve canonical standalone users in parallel with exact numeric shards.
- // numeric_people is immutable during this phase; only genuinely missing keys enter shards.
- constexpr size_t NUM_SHARDS=256;
- array<unordered_map<uint64_t,uint32_t>,NUM_SHARDS> num_standalone;
- array<mutex,NUM_SHARDS> num_mu;
- size_t num_per=max<size_t>(16,pending_num_n/16/NUM_SHARDS+8);
- for(auto& m:num_standalone)m.reserve(num_per);
- uint32_t num_base=(uint32_t)people.size();
- people.resize((size_t)num_base+pending_num_n);
- vector<uint64_t> new_num_keys(pending_num_n,UINT64_MAX);
- atomic<uint32_t> next_num(num_base);
- vector<vector<Evt>> resolved_num(PARTS);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,1)
-#endif
- for(size_t part=0;part<PARTS;part++){
-  auto&src=pending_num_by_part[part];auto&dst=resolved_num[part];dst.reserve(src.size());
+ for(auto&src:pending_num_by_part){
   for(const PendingNum&e:src){
    uint32_t p=numeric_people.find(e.key);
    if(p==UINT32_MAX){
-    size_t sh=FlatNumPeople::h(e.key+1)&(NUM_SHARDS-1);
-    lock_guard<mutex> lock(num_mu[sh]);
-    auto&m=num_standalone[sh];auto it=m.find(e.key);
-    if(it==m.end()){
-     p=next_num.fetch_add(1,memory_order_relaxed);m.emplace(e.key,p);new_num_keys[p-num_base]=e.key;
-    }else p=it->second;
+    p=(uint32_t)people.size();owned_user_names.push_back(canonical_user_name(e.key));people.push_back(owned_user_names.back());numeric_people.add(e.key,p);
    }
-   dst.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
+   events.push_back({e.t,p,e.price,e.category,e.is_purchase,0});
   }
   vector<PendingNum>().swap(src);
  }
- uint32_t num_final=next_num.load(memory_order_relaxed);
- people.resize(num_final);
- for(uint32_t p=num_base;p<num_final;p++){
-  uint64_t key=new_num_keys[p-num_base];
-  owned_user_names.push_back(canonical_user_name(key));people[p]=owned_user_names.back();numeric_people.add(key,p);
- }
- for(auto&v:resolved_num){events.insert(events.end(),v.begin(),v.end());vector<Evt>().swap(v);}
- vector<vector<Evt>>().swap(resolved_num);
  vector<vector<PendingNum>>().swap(pending_num_by_part);
  // Resolve standalone IDs in parallel through exact sharded maps. IDs are internal only,
  // so assignment order is irrelevant; every equal byte string still gets exactly one person.
