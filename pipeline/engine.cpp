@@ -577,32 +577,8 @@ static void radix64(vector<T>& a, Key key, int passes=4){
 static void order_events(vector<Evt>& es){
  radix64(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
-static void order_clicks(vector<Click>& cs,size_t person_count){
- if(cs.size()<2)return;
- // Dense person bucket + tiny local time sorts. This avoids a four-pass global radix
- // over the click array while preserving contiguous (person,time) order exactly.
- vector<size_t> off(person_count+1,0);
- for(const Click& c:cs)off[(size_t)c.person+1]++;
- for(size_t p=1;p<off.size();p++)off[p]+=off[p-1];
- vector<size_t> pos=off;
- vector<Click> tmp(cs.size());
- for(const Click& c:cs)tmp[pos[c.person]++]=c;
- cs.swap(tmp);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic,256)
-#endif
- for(size_t p=0;p<person_count;p++){
-  size_t lo=off[p],hi=off[p+1],n=hi-lo;
-  if(n<2)continue;
-  Click* q=cs.data()+lo;
-  if(n<=16){
-   for(size_t i=1;i<n;i++){
-    Click v=q[i];size_t j=i;
-    while(j&&v.t<q[j-1].t){q[j]=q[j-1];--j;}
-    q[j]=v;
-   }
-  }else sort(q,q+n,[](const Click&a,const Click&b){return a.t<b.t;});
- }
+static void order_clicks(vector<Click>& cs){
+ radix64(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
 }
 int main(){
  const string data=getenv("DATA_DIR")?getenv("DATA_DIR"):"/data";
@@ -1099,7 +1075,7 @@ int main(){
  cerr<<"sessions="<<sessions.size()<<" user_days="<<ud.size()<<"\n";lap("sessionize");
  lap("top_category");
  vector<CampDay> camp((size_t)campaigns.size()*nday);
- order_clicks(clicks,people.size());lap("click_sort");
+ order_clicks(clicks);lap("click_sort");
  // Whole-person work units keep attribution cursors and assist intervals local
  // to one worker. Aggregate into private campaign arrays, then reduce once.
  const int64_t click_base=ws-WEEK;
