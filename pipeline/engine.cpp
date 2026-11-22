@@ -575,16 +575,16 @@ static void radix64(vector<T>& a, Key key, int passes=4){
  }
 }
 static void order_events(vector<Evt>& es,size_t person_count,int64_t window_ms){
- // For the 14-day 20M workload the canonical person fits 20 bits and the
- // event timestamp fits 31 bits. Three 17-bit LSD passes suffice exactly.
- if(person_count<(1u<<20)&&window_ms<(1LL<<31))
-  radix64<17>(es,[](const Evt&e){return (uint64_t(e.person)<<31)|e.t;},3);
+ // For the normal generated windows, timestamps fit 31 bits. Person IDs up
+ // to 23 bits can be ordered exactly in three 18-bit LSD passes.
+ if(person_count<(1u<<23)&&window_ms<(1LL<<31))
+  radix64<18>(es,[](const Evt&e){return (uint64_t(e.person)<<31)|e.t;},3);
  else
   radix64<16>(es,[](const Evt&e){return (uint64_t(e.person)<<32)|e.t;},4);
 }
 static void order_clicks(vector<Click>& cs,size_t person_count,int64_t click_window_ms){
- if(person_count<(1u<<20)&&click_window_ms<(1LL<<31))
-  radix64<17>(cs,[](const Click&c){return (uint64_t(c.person)<<31)|c.t;},3);
+ if(person_count<(1u<<23)&&click_window_ms<(1LL<<31))
+  radix64<18>(cs,[](const Click&c){return (uint64_t(c.person)<<31)|c.t;},3);
  else
   radix64<16>(cs,[](const Click&c){return (uint64_t(c.person)<<32)|c.t;},4);
 }
