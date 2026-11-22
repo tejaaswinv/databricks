@@ -1,13 +1,13 @@
 name: Validate shopping sessions
 on:
   push:
-    branches: [main]
+    branches: [main, fused-optimize]
   workflow_dispatch:
     inputs:
       baseline_ref:
         description: Baseline commit for the paired benchmark
         required: true
-        default: 8d7ff0560673f0ce4c9152b044ee52effb0eaed7
+        default: f33bbe4ac67593e25e13e4055ffe0b6993218b82
 
 jobs:
   validate:
@@ -48,7 +48,7 @@ jobs:
           python3 starter-duckdb/scripts/compare.py out dev-answer
       - name: Paired practice-scale benchmark against the previous main
         env:
-          BASELINE_REF: ${{ inputs.baseline_ref || '8d7ff0560673f0ce4c9152b044ee52effb0eaed7' }}
+          BASELINE_REF: ${{ inputs.baseline_ref || 'f33bbe4ac67593e25e13e4055ffe0b6993218b82' }}
         run: |
           lscpu
           generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output bench
